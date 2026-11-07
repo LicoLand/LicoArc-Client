@@ -66,9 +66,20 @@ jobs:
             exit 1
           fi
           echo "name=$crate" >> "$GITHUB_OUTPUT"
+          # The first version of a crate is uploaded manually (crates.io needs
+          # it before Trusted Publishing can be configured); its tag then only
+          # records provenance, so an already-published version is not re-sent.
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -A "LicoLand release workflow (github.com/LicoLand)" "https://crates.io/api/v1/crates/$crate/$version")"
+          case "$status" in
+            200) echo "::notice::$crate $version is already on crates.io"; echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::crates.io lookup for $crate $version returned $status"; exit 1 ;;
+          esac
       - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        if: steps.crate.outputs.published == 'false'
         id: auth
       - name: Publish
+        if: steps.crate.outputs.published == 'false'
         working-directory: ${{ runner.temp }}/publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
