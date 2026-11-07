@@ -75,9 +75,11 @@ jobs:
           case "$status" in
             200)
               curl -fsSL -A "$agent" "https://static.crates.io/crates/$crate/$crate-$version.crate" -o published.crate
-              published_sha="$(tar -xOzf published.crate "$crate-$version/.cargo_vcs_info.json" | jq -r '.git.sha1')"
-              if [ "$published_sha" != "$SHA" ]; then
-                echo "::error::$crate $version on crates.io was packaged from $published_sha, not $SHA"
+              vcs="$(tar -xOzf published.crate "$crate-$version/.cargo_vcs_info.json")"
+              published_sha="$(jq -r '.git.sha1' <<<"$vcs")"
+              published_dirty="$(jq -r '.git.dirty // false' <<<"$vcs")"
+              if [ "$published_sha" != "$SHA" ] || [ "$published_dirty" != "false" ]; then
+                echo "::error::$crate $version on crates.io was not packaged from a clean checkout of $SHA"
                 exit 1
               fi
               echo "::notice::$crate $version is already on crates.io from $SHA"
