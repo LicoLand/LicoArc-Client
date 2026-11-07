@@ -462,9 +462,12 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.sync_all()?;
     }
     std::fs::rename(&temporary, path)?;
+    #[cfg(unix)]
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
+        // Windows has no directory fsync; the rename is the durability
+        // boundary there, so the fsync is a unix-only step.
         std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(())

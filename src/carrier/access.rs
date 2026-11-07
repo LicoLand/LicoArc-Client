@@ -189,7 +189,9 @@ impl AccessGrant {
         let temporary = self.store.with_extension("tmp");
         write_owner_only(&temporary, text.as_bytes())?;
         std::fs::rename(&temporary, &self.store)?;
-        // The rename is only durable once the directory entry is.
+        // The rename is only durable once the directory entry is. Windows
+        // has no directory fsync, so this is a unix-only step.
+        #[cfg(unix)]
         if let Some(parent) = self.store.parent()
             && !parent.as_os_str().is_empty()
         {
