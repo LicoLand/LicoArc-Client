@@ -68,10 +68,21 @@ jobs:
           echo "name=$crate" >> "$GITHUB_OUTPUT"
           # The first version of a crate is uploaded manually (crates.io needs
           # it before Trusted Publishing can be configured); its tag then only
-          # records provenance, so an already-published version is not re-sent.
-          status="$(curl -sS -o /dev/null -w '%{http_code}' -A "LicoLand release workflow (github.com/LicoLand)" "https://crates.io/api/v1/crates/$crate/$version")"
+          # records provenance. An already-published version is not re-sent,
+          # but it must have been packaged from exactly this tagged commit.
+          agent="LicoLand release workflow (github.com/LicoLand)"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -A "$agent" "https://crates.io/api/v1/crates/$crate/$version")"
           case "$status" in
-            200) echo "::notice::$crate $version is already on crates.io"; echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            200)
+              curl -fsSL -A "$agent" "https://static.crates.io/crates/$crate/$crate-$version.crate" -o published.crate
+              published_sha="$(tar -xOzf published.crate "$crate-$version/.cargo_vcs_info.json" | jq -r '.git.sha1')"
+              if [ "$published_sha" != "$SHA" ]; then
+                echo "::error::$crate $version on crates.io was packaged from $published_sha, not $SHA"
+                exit 1
+              fi
+              echo "::notice::$crate $version is already on crates.io from $SHA"
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              ;;
             404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
             *) echo "::error::crates.io lookup for $crate $version returned $status"; exit 1 ;;
           esac
