@@ -1,0 +1,40 @@
+[package]
+name = "licoarc-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "Standalone Lico Arc endpoint client: runtime, BadTower carrier, ports, and CLI."
+repository = "https://github.com/LicoLand/LicoArc-Client"
+readme = "docs/README.md"
+keywords = ["licoarc", "protocol", "post-quantum"]
+categories = ["cryptography", "network-programming"]
+
+[lib]
+name = "licoarc_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "licoarc-client"
+path = "src/main.rs"
+
+[dependencies]
+licoarc = "=0.1.0"
+anyhow = "1.0.98"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+zeroize = { version = "=1.9.0", default-features = false }
+getrandom = "0.4.3"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "fs"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+

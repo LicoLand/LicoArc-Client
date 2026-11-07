@@ -1,0 +1,20 @@
+target/
+build/
+cache/
+coverage/
+*.log
+.DS_Store
+
+# Local-only working material; never publish directly.
+docs/plans/
+docs/reports/
+tmp/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local dev artifacts (authority bundle, devnet state)
+dev/
+.cargo/
