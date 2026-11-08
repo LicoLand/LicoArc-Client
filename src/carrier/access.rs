@@ -479,10 +479,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("licoarc-access-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("grant.json");
+        let mut public_key = [0u8; 32];
+        let mut secret_key = zeroize::Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut public_key).unwrap();
+        getrandom::fill(secret_key.as_mut()).unwrap();
         let record = serde_json::json!({
             "accessToken": "bta2.x",
-            "publicKey": encode_base64url(&[1u8; 32]),
-            "secretKey": encode_base64url(&[2u8; 32]),
+            "publicKey": encode_base64url(&public_key),
+            "secretKey": encode_base64url(secret_key.as_ref()),
             "counter": 0,
         });
         std::fs::write(&file, record.to_string()).unwrap();

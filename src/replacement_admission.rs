@@ -471,11 +471,23 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    /// A seed that is stable for one marker within this test process and never
+    /// checked in: it is derived from a salt drawn from the OS at first use.
+    fn seed(provider: &impl Provider, algorithm: &[u8], marker: u8) -> [u8; 32] {
+        static SALT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+        let salt = SALT.get_or_init(|| {
+            let mut salt = [0u8; 32];
+            getrandom::fill(&mut salt).expect("test salt");
+            salt
+        });
+        provider.sha256(&[salt.as_slice(), algorithm, &[marker]].concat())
+    }
+
     /// Mirrors the SDK's own `authority_pair`
     /// (`src/conformance/executor.rs:521-549`).
     fn pair(provider: &impl Provider, purpose: &'static str, marker: u8) -> Pair {
-        let ed25519_seed = [marker; 32];
-        let ml_dsa_65_seed = [marker.wrapping_add(1); 32];
+        let ed25519_seed = seed(provider, b"ed25519", marker);
+        let ml_dsa_65_seed = seed(provider, b"ml-dsa-65", marker);
         let ed25519_public = provider.ed25519_public(&ed25519_seed);
         let ml_dsa_65_public = provider.ml_dsa_65_public(&ml_dsa_65_seed);
         let ed25519_key_id =
@@ -708,16 +720,9 @@ mod tests {
                 provider, &new_management, &proof_input, "replacement-management-possession"
             ),
             "recoverySignatures": signatures(
-                provider, &new_recovery, &proof_input, "recovery-possession-placeholder"
+                provider, &new_recovery, &proof_input, "replacement-recovery-possession"
             ),
         });
-        // The recovery axis did not change, so only the management axis carries a
-        // proof. A signature field on the unchanged axis is `InvalidTransition`
-        // (`src/identity.rs:633-635`).
-        replaced["possessionProof"]
-            .as_object_mut()
-            .expect("possession proof object")
-            .remove("recoverySignatures");
         sign_state(provider, &mut replaced, &recovery, "authority-recovery")
             .expect("recovery authority signature");
         replaced
@@ -815,7 +820,7 @@ mod tests {
     ///
     /// ```text
     /// LICOARC_AUTHORITY_BUNDLE=<path> \
-    ///   cargo test -p licoup-protocol-bindings --lib -- --ignored --nocapture
+    ///   cargo test -p licoarc-client --lib -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "requires LICOARC_AUTHORITY_BUNDLE and real ml-dsa-65 signing"]
@@ -852,8 +857,11 @@ mod tests {
             .admit()
             .expect("the fixed Candidate is admitted");
         let adapter = SdkReplacementAuthority::with_admitted_line(line);
+        // The authenticated session is bound to the state it is presenting.
+        let mut admission = admission(&fixture);
+        admission.session.authority_state_digest = direct.state_digest;
         let verified = adapter
-            .admit(&replaced, &admission(&fixture))
+            .admit(&replaced, &admission)
             .expect("the SDK admits the replacement over the pinned line");
         assert_eq!(verified.authority_epoch(), 1);
         assert_eq!(
@@ -887,10 +895,11 @@ mod tests {
         );
     }
 
-    /// An exact replay of the accepted state is refused rather than re-admitted.
+    /// Re-presenting the accepted state is idempotent: the SDK returns the
+    /// accepted authority itself and nothing advances.
     #[test]
     #[ignore = "requires LICOARC_AUTHORITY_BUNDLE and real ml-dsa-65 signing"]
-    fn an_exact_replay_of_the_accepted_state_is_refused() {
+    fn re_presenting_the_accepted_state_admits_it_unchanged() {
         let provider = RustCryptoProvider;
         let fixture = fixture(&provider);
         let bytes = authority_bytes();
@@ -899,12 +908,12 @@ mod tests {
             .expect("the fixed Candidate is admitted");
         let adapter = SdkReplacementAuthority::with_admitted_line(line);
 
-        assert_eq!(
-            adapter
-                .admit(&fixture.genesis, &admission(&fixture))
-                .expect_err("a replay of the accepted state admits nothing"),
-            ReplacementAdmissionRefusal::VerificationRefused
-        );
+        let verified = adapter
+            .admit(&fixture.genesis, &admission(&fixture))
+            .expect("the accepted state is re-admitted as itself");
+        assert_eq!(verified.authority_epoch(), 0);
+        assert_eq!(verified.state_digest(), fixture.accepted.state_digest);
+        assert_eq!(verified.state(), &fixture.genesis);
     }
 
     /// A record signed for another subject's authority is refused.
