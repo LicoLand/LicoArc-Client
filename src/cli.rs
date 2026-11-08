@@ -707,8 +707,11 @@ impl PlaintextReceiver for PlaintextSink<'_> {
             Some(dir) => {
                 std::fs::create_dir_all(dir).map_err(|_| failed())?;
                 let digest = licoarc::provider::fixed_provider().sha256(plaintext);
-                std::fs::write(dir.join(format!("{}.record", hex(&digest))), plaintext)
-                    .map_err(|_| failed())
+                crate::providers::fs::write_atomic(
+                    &dir.join(format!("{}.record", hex(&digest))),
+                    plaintext,
+                )
+                .map_err(|_| failed())
             }
             None => self.out.write_all(plaintext).map_err(|_| failed()),
         }

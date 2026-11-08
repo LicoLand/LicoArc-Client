@@ -131,7 +131,7 @@ impl LocalIdentity {
         };
         let body = serde_json::to_vec_pretty(&file)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        fs::write(dir.join("identity.json"), body)
+        crate::providers::fs::write_atomic(&dir.join("identity.json"), &body)
     }
 
     /// Loads a previously persisted identity from `dir`.
@@ -316,13 +316,11 @@ mod tests {
     }
 
     fn temp() -> TempDir {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "licoarc-client-identity-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
         TempDir(path)
