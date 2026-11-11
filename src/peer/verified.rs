@@ -1,7 +1,7 @@
 //! The verified-unit facts this boundary consumes.
 //!
 //! Verification belongs to the pinned SDK, which this domain reaches only
-//! through `licoup_protocol_bindings`. This boundary verifies nothing and
+//! through the crate's own SDK boundary. This boundary verifies nothing and
 //! decides no protocol outcome: it consumes one [`VerifiedUnit`] value that the
 //! SDK boundary produced, and records what that value says. A value of
 //! [`PeerMessage`](super::PeerMessage) therefore always names a unit some SDK
@@ -31,8 +31,6 @@
 //!
 //! That implementation is the only one: callers and fixtures consume it instead
 //! of declaring their own copy of the boundary's facts.
-//!
-//! No other file in this domain changes when that adapter is added.
 
 /// The verified device identity of one inbound unit.
 ///

@@ -1,9 +1,11 @@
 //! Inbound mapping for one verified peer unit at the native endpoint boundary.
 //!
-//! The mobile relay domain owns the actual platform adapters; this module is
-//! its inbound bridge. Protocol decisions stay with the pinned SDK and arrive
-//! only as one [`VerifiedUnit`] value produced by the SDK boundary (see
-//! [`verified`]), so a value of this module's [`PeerMessage`] always names a
+//! The consumer owns the platform adapters that feed this boundary; this
+//! module is the inbound bridge they compose. Protocol decisions stay with
+//! the pinned SDK and arrive
+//! only as one [`VerifiedUnit`] value produced by the SDK boundary (see the
+//! `verified` submodule), so a value of this module's [`PeerMessage`] always
+//! names a
 //! unit an SDK verification entry actually produced.
 //!
 //! Three boundaries are load-bearing:
@@ -14,8 +16,7 @@
 //!   read as an author, a device, or trust.
 //! * A station's own report is a read-only [`StationHint`]. It is recorded as
 //!   such and can never become delivery, admission, read, or acceptance
-//!   evidence (`docs/protocols/licoarc-station-adapter.md`: a station
-//!   acknowledgement is not endpoint evidence).
+//!   evidence: a station acknowledgement is not endpoint evidence.
 //! * Duplicate suppression and causal placement use stable identities only:
 //!   the SDK's own replay identity for one protected unit, and the peer's
 //!   logical message id for a re-protected resend. Local arrival order stays

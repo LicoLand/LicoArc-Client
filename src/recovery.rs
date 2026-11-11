@@ -4,16 +4,15 @@
 //! restart must never be collapsed into one "session is dead" decision. The
 //! pinned SDK distinguishes the cases itself; this module only classifies them
 //! into the next legal client action, citing the SDK behaviour each rule
-//! mirrors (`licoarc-rust` at revision
-//! `244ce7186cac1690c18f091dbe02df36a0860ef4`).
+//! mirrors (`src/...` paths inside the pinned `licoarc` package).
 //!
 //! Two rules apply to every case:
 //!
 //! * An already-established, already-authenticated result is never re-derived
 //!   from a local sequence. Its reconciliation exit is to re-drive exactly the
 //!   committed work the protocol layer already identified
-//!   (`Endpoint::retry_record`, `src/endpoint/mod.rs:956-970`); a second fresh
-//!   packet for one session is refused (`src/endpoint/mod.rs:908-914`).
+//!   (`Endpoint::retry_record`, `src/endpoint/mod.rs`); a second fresh
+//!   packet for one session is refused (`src/endpoint/mod.rs`).
 //! * A refused call is refused alone. The SDK refuses a version, a payload, or a
 //!   generation per call, so the established result and every other accepted
 //!   call stay usable.
@@ -27,7 +26,7 @@ pub enum RecoveryEvent {
     /// `pending_work` is whether a committed item is still outstanding.
     TransportDisconnected { pending_work: bool },
     /// One transport attempt ended with the SDK's own classification
-    /// (`src/transport.rs:222-229`). `Ambiguous` is the 504 case: the attempt
+    /// (`src/transport.rs`). `Ambiguous` is the 504 case: the attempt
     /// may or may not have been accepted.
     TransportAttempt(TransportOutcome),
     /// A verified authority roster revoked this device, or could not re-admit
@@ -37,11 +36,11 @@ pub enum RecoveryEvent {
         established_result_authenticated: bool,
     },
     /// The protocol session was deleted. `Deleted` is absorbing: every later
-    /// operation on it is refused (`src/endpoint/mod.rs:1195-1198`).
+    /// operation on it is refused (`src/endpoint/mod.rs`).
     SessionDeleted,
     /// A caller-owned restart saw a persisted generation that is not the
-    /// current one (`validate_restart`, `src/state/mod.rs:545-556`;
-    /// `Endpoint::restart`, `src/endpoint/mod.rs:1240-1253`).
+    /// current one (`validate_restart`, `src/state/mod.rs`;
+    /// `Endpoint::restart`, `src/endpoint/mod.rs`).
     GenerationRestart {
         persisted: Revision,
         current: Revision,
@@ -101,8 +100,8 @@ impl RecoveryEvent {
             }
             // A revocation governs new admissions. An entry that was already
             // accepted stays as it was and is skipped by the roster check
-            // (`src/identity.rs:255-263`), while a new payload from a device that
-            // is no longer active is refused (`src/identity.rs:380-397`).
+            // (`src/identity.rs`), while a new payload from a device that
+            // is no longer active is refused (`src/identity.rs`).
             Self::RosterRevocation {
                 established_result_authenticated,
             } => {

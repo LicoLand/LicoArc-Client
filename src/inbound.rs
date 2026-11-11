@@ -3,23 +3,23 @@
 //! This is the client-side consumer of the fixed Candidate. It never decides a
 //! protocol outcome: it calls the SDK entry that owns each decision and records
 //! what that entry verified. Every fact below names the SDK entry that produced
-//! it, read at revision `244ce7186cac1690c18f091dbe02df36a0860ef4`.
+//! it (`src/...` paths inside the pinned `licoarc` package).
 //!
 //! One inbound unit yields one [`TrustFacts`] binding:
 //!
 //! | fact | SDK verification entry |
 //! | --- | --- |
-//! | author | handshake: `FirstPacket::initiator_user_authority_state_digest`, accepted by `Endpoint::accept_first_packet`, `src/endpoint/mod.rs:534-652` |
-//! | device | handshake: `FirstPacket::initiator_identity_state_digest` plus the accepted ed25519/ml-dsa key ids, and `TrustedIdentity::resolve` for the identity trust facts, `src/endpoint/mod.rs:69-108` |
-//! | permission | per unit: `AuthorizedSession::{authenticated,sender_authorized,sender_endpoint,expected_sender_endpoint}`, refused by `reliable::apply_endpoint_confirmation`, `src/reliable.rs:79-88`; the roster layer above it adds `AuthenticatedAuthoritySession::authenticated` and the active-device check, `src/identity.rs:365-397`, reached through [`EndpointConsumer::admit_authority`] |
-//! | protocol version | client: [`crate::version::AcceptedVersion`], plus the SDK's own line binding `src/identity.rs:145-147` |
-//! | replay identity | handshake: `SessionAccept::{transcript_digest,session_context_digest}`, `src/endpoint/mod.rs:605-624`; record: the `PendingId` of `Endpoint::receive_record`, `src/endpoint/mod.rs:1009-1041` |
+//! | author | handshake: `FirstPacket::initiator_user_authority_state_digest`, accepted by `Endpoint::accept_first_packet`, `src/endpoint/mod.rs` |
+//! | device | handshake: `FirstPacket::initiator_identity_state_digest` plus the accepted ed25519/ml-dsa key ids, and `TrustedIdentity::resolve` for the identity trust facts, `src/endpoint/mod.rs` |
+//! | permission | per unit: `AuthorizedSession::{authenticated,sender_authorized,sender_endpoint,expected_sender_endpoint}`, refused by `reliable::apply_endpoint_confirmation`, `src/reliable.rs`; the roster layer above it adds `AuthenticatedAuthoritySession::authenticated` and the active-device check, `src/identity.rs`, reached through [`EndpointConsumer::admit_authority`] |
+//! | protocol version | client: [`crate::version::AcceptedVersion`], plus the SDK's own line binding `src/identity.rs` |
+//! | replay identity | handshake: `SessionAccept::{transcript_digest,session_context_digest}`, `src/endpoint/mod.rs`; record: the `PendingId` of `Endpoint::receive_record`, `src/endpoint/mod.rs` |
 //!
 //! Raw wire is not the client's internal schema, and a local event sequence is
 //! not network author order. The identities this module exposes are the SDK's
 //! own: message and session ids are network identities, and a confirmation's
 //! confirmed ids must be strictly increasing (`validate_confirmation_ids`,
-//! `src/reliable.rs:225-234`), so a client cannot substitute arrival order.
+//! `src/reliable.rs`), so a client cannot substitute arrival order.
 //!
 //! Four facts are reported separately and never collapsed into one "delivered"
 //! boolean:
@@ -27,11 +27,11 @@
 //! * message delivery — [`EndpointConsumer::note_delivery`], the peer endpoint
 //!   accepted the logical message (`ConfirmationStage::EndpointAccepted`);
 //! * reliable exchange — [`EndpointConsumer::note_exchange`], the intent's own
-//!   retry/migration state (`ReliableState`, `src/reliable.rs:172-219`);
+//!   retry/migration state (`ReliableState`, `src/reliable.rs`);
 //! * user read — [`UserRead`], client-owned: the pinned SDK has no read receipt;
 //! * task acceptance — [`EndpointConsumer::note_acceptance`], which the SDK
 //!   grants only for `ConfirmationStage::EffectCompleted` with the expected
-//!   result digest (`src/reliable.rs:121-150`).
+//!   result digest (`src/reliable.rs`).
 //!
 //! A peer message identity is never promoted to authority: the permission facts
 //! come from the session the SDK authenticated, and a capability proxy's command
@@ -119,7 +119,7 @@ pub enum PermissionFact {
     HandshakeAuthenticated,
     /// One message unit on an authenticated session. The SDK requires every
     /// field here before it applies a confirmation, so a message's own identity
-    /// can never stand in for authority (`src/reliable.rs:79-88`).
+    /// can never stand in for authority (`src/reliable.rs`).
     Session {
         authenticated: bool,
         sender_authorized: bool,
@@ -145,9 +145,9 @@ impl PermissionFact {
 ///
 /// A byte-identical replay of the same unit carries the same identity, and the
 /// SDK refuses reuse: an exact handshake replay returns the same accept while a
-/// changed one is refused with `PrekeyConsumed` (`src/endpoint/mod.rs:548-561`),
+/// changed one is refused with `PrekeyConsumed` (`src/endpoint/mod.rs`),
 /// and the record layer refuses a replayed or stale record with `Replay`
-/// (`src/protection/mod.rs:488`).
+/// (`src/protection/mod.rs`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplayIdentity {
     /// One accepted handshake, identified by the SDK's transcript and session
@@ -230,7 +230,7 @@ impl TrustFacts {
     /// out of one accepted handshake, or when the packet names a line this
     /// client does not accept. The checks repeat the equalities
     /// `Endpoint::accept_first_packet` itself requires before it produces an
-    /// accept (`src/endpoint/mod.rs:534-660`): the accept binds the packet's
+    /// accept (`src/endpoint/mod.rs`): the accept binds the packet's
     /// initiator authority digest, its pair sequence, and the responder identity
     /// the packet addressed, and both the packet and the accept must name the
     /// verified line. They add no protocol policy of their own, and they cannot
@@ -352,8 +352,7 @@ impl std::error::Error for InboundRefusal {}
 /// The client's consumer of the pinned LicoArc endpoint SDK.
 ///
 /// It holds exactly one thing: the version this build accepts. Constructing it
-/// initializes no custody backend, starts no listener, and touches no network,
-/// so a build without the optional pairing package stays inert.
+/// initializes no custody backend, starts no listener, and touches no network.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EndpointConsumer {
     accepted: AcceptedVersion,
@@ -386,7 +385,7 @@ impl EndpointConsumer {
     ///
     /// `TrustedIdentity::resolve` compares every identity key against the
     /// caller-owned trust facts for the verified line and refuses any mismatch
-    /// (`src/endpoint/mod.rs:69-108`).
+    /// (`src/endpoint/mod.rs`).
     pub fn trust_peer(
         &self,
         line: &VerifiedProtocolLine,
@@ -458,7 +457,7 @@ impl EndpointConsumer {
     ///
     /// The SDK applies the confirmation only on an authenticated session whose
     /// authorized sender is the expected endpoint, and only at
-    /// `ConfirmationStage::EndpointAccepted` (`src/reliable.rs:71-163`).
+    /// `ConfirmationStage::EndpointAccepted` (`src/reliable.rs`).
     pub fn note_delivery(
         &self,
         current: FinalityState,
@@ -482,7 +481,7 @@ impl EndpointConsumer {
     ///
     /// The SDK grants this only at `ConfirmationStage::EffectCompleted` with a
     /// successful outcome and the expected result digest; delivery alone never
-    /// reaches it (`src/reliable.rs:121-150`).
+    /// reaches it (`src/reliable.rs`).
     pub fn note_acceptance(
         &self,
         current: FinalityState,
@@ -504,7 +503,7 @@ impl EndpointConsumer {
     }
 
     /// Advances the intent's reliable-exchange state (`ReliableState::retry`,
-    /// `src/reliable.rs:184-219`).
+    /// `src/reliable.rs`).
     ///
     /// A completed or failed intent cannot be retried, and a repeated route may
     /// only resend the identical protected packet.
@@ -544,7 +543,7 @@ where
     /// The returned [`PendingId`] is the SDK's content-derived identity of the
     /// committed record; callers release its plaintext and settle it with that
     /// id. A replayed or stale record is refused by the SDK itself
-    /// (`src/protection/mod.rs:488`).
+    /// (`src/protection/mod.rs`).
     ///
     /// Handshake authentication is not a command grant: consumers must recheck
     /// the current roster and application admission independently for every new
@@ -1000,7 +999,7 @@ mod tests {
 
         // Raw bytes are not the client's schema. Only the SDK's closed decoder
         // accepts a message, and it refuses anything outside its own
-        // representation (`Message::decode`, `src/messaging.rs:136-140`).
+        // representation (`Message::decode`, `src/messaging.rs`).
         assert!(Message::decode(b"raw wire is not a message").is_err());
 
         let mut message = Message {
@@ -1020,7 +1019,7 @@ mod tests {
 
         // An unknown critical extension is refused rather than ignored, so a peer
         // cannot smuggle a field this client does not understand
-        // (`src/messaging.rs:79-81`).
+        // (`src/messaging.rs`).
         message.critical = vec![7];
         assert_eq!(
             message.validate().unwrap_err().code,

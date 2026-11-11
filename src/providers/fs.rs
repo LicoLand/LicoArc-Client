@@ -1,4 +1,4 @@
-//! File-backed [`KeyCustody`] for the standalone CLI.
+//! File-backed [`crate::ports::KeyCustody`] for the standalone CLI.
 //!
 //! One index file holds every custody object: `{token → purpose, lifecycle,
 //! secret bytes}`. Every mutation serializes the complete table to a sibling
@@ -8,8 +8,8 @@
 //!
 //! The secrets on disk are raw seed bytes protected only by file mode `0600`.
 //! That is a development custody backend for the standalone client, not a
-//! product keystore: consumers with a real custody requirement (LicoUp's
-//! keychain custody, for example) implement [`KeyCustody`] themselves.
+//! product keystore: consumers with a real custody requirement implement
+//! [`crate::ports::KeyCustody`] themselves.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -87,7 +87,8 @@ impl fmt::Display for CustodyRefusal {
 
 impl std::error::Error for CustodyRefusal {}
 
-/// A [`KeyCustody`] whose objects live in one atomically replaced index file.
+/// A [`crate::ports::KeyCustody`] whose objects live in one atomically replaced
+/// index file.
 ///
 /// `Clone` shares the same table and the same file, so a coupled
 /// [`crate::providers::MemoryState`] and the adapter's own custody view always

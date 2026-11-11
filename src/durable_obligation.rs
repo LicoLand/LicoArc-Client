@@ -3,8 +3,8 @@
 //!
 //! The protocol layer decides what an obligation *is*: the pinned SDK commits a
 //! delivery unit together with the protocol snapshot, and the caller-owned ports
-//! ([`crate::state::AtomicState`], mirrored for the adapter in
-//! `licoup_endpoint_core::ports`) hand that same unit back when it is re-driven or
+//! ([`crate::state::AtomicState`], mirrored consumer-side in
+//! [`crate::ports::AtomicState`]) hand that same unit back when it is re-driven or
 //! settled. This module owns the client-side question the ports leave open:
 //! **which obligations may be discarded, and by what**.
 //!

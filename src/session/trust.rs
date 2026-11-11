@@ -6,7 +6,7 @@
 //! means for the handshake.
 //!
 //! A standalone deployment seeds the store from the peer's pairing offer.
-//! LicoUp supplies its own richer trust view through the same port.
+//! A consumer with a richer trust view implements the same port.
 
 use std::collections::BTreeMap;
 

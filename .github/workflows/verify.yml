@@ -21,9 +21,9 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy
-          curl -fsSL "https://raw.githubusercontent.com/LicoLand/LicoArc/8489b611b14c0d4dd27e7d702f5c26aff82fba30/artifacts/v1/licoarc.bundle.json" -o "$RUNNER_TEMP/licoarc.bundle.json"
+          curl -fsSL "https://raw.githubusercontent.com/LicoLand/LicoArc/e33b151a6d9870b73857f68d333f15010584cc2c/artifacts/v1/licoarc.bundle.json" -o "$RUNNER_TEMP/licoarc.bundle.json"
           actual="$(shasum -a 256 "$RUNNER_TEMP/licoarc.bundle.json" | cut -d' ' -f1)"
-          test "$actual" = "df271d20fb4662ef6795cd1e7eea0d917a6e8426b50e773f41558a01dc5221d3"
+          test "$actual" = "e47aa234dee48ca3f791c733b2514c93f1e912bce8f5754813879c6b197d6814"
           echo "LICOARC_AUTHORITY_BUNDLE=$RUNNER_TEMP/licoarc.bundle.json" >> "$GITHUB_ENV"
       - name: Verify
         env:

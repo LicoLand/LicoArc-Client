@@ -1,70 +1,98 @@
-//! Blocking [`Transport`] port adapter over the asynchronous Station client.
+//! Blocking [`Transport`] port adapter over the asynchronous mailbox client.
 //!
 //! The SDK's packet boundary is synchronous: `dispatch_pending` calls
 //! `PacketCarrier::send` from inside the protocol drive. The carrier is
 //! asynchronous, so this adapter owns one dedicated current-thread I/O
-//! runtime and blocks the protocol thread on one bounded submit exchange.
-//! The submit loop itself is the profile's own bounded same-identifier retry,
-//! so a block here never turns into an unbounded wait.
+//! runtime and blocks the protocol thread on one submit exchange.
 
 use std::sync::Arc;
 
 use crate::ports::{PortFailure, Transport, TransportOutcome};
 
-use super::client::{StationClient, StationError};
+use super::connection::{MailboxClient, StationError};
 use super::token::HandleToken;
 
-/// One outbound delivery lane: a Station client plus one peer handle.
+/// One outbound delivery lane: a mailbox client plus one peer handle.
 ///
 /// Construct it outside a Tokio context; it must not be used from inside
 /// another runtime's worker, because `block_on` cannot nest.
 pub struct SubmitCarrier {
-    client: Arc<StationClient>,
+    client: Arc<MailboxClient>,
     handle: HandleToken,
-    runtime: tokio::runtime::Runtime,
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl SubmitCarrier {
-    /// Binds one shared Station client to one peer handle with its own I/O
-    /// runtime.
-    pub fn new(client: Arc<StationClient>, handle: HandleToken) -> Result<Self, PortFailure> {
+    /// Binds one live mailbox client to one peer handle.
+    ///
+    /// The client's I/O task must run on a multi-threaded runtime that
+    /// outlives it (see [`MailboxClient::connect`]). A client connected on a
+    /// current-thread runtime only advances its I/O task while that
+    /// runtime's `block_on` runs, and `submit`'s private `block_on` would
+    /// wait on a RESULT that can never arrive — so this constructor refuses
+    /// such a client with [`std::io::ErrorKind::Unsupported`] instead of
+    /// deadlocking.
+    pub fn new(client: Arc<MailboxClient>, handle: HandleToken) -> Result<Self, std::io::Error> {
+        if client.is_current_thread_runtime() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "mailbox client connected on a current-thread runtime;                  SubmitCarrier needs the connection's I/O task on a                  multi-threaded runtime that outlives the client",
+            ));
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .map_err(|_| PortFailure::Unavailable)?;
+            .build()?;
         Ok(Self {
             client,
             handle,
-            runtime,
+            runtime: Some(runtime),
         })
+    }
+
+    /// The bound peer handle.
+    #[must_use]
+    pub const fn handle(&self) -> HandleToken {
+        self.handle
     }
 }
 
 impl Transport for SubmitCarrier {
     fn submit(&mut self, packet: &[u8]) -> Result<TransportOutcome, PortFailure> {
-        let client = self.client.clone();
-        let handle = self.handle;
-        let result = self
+        match self
             .runtime
-            .block_on(async move { client.submit(handle, packet).await });
-        match result {
+            .as_ref()
+            .expect("submit after drop")
+            .block_on(self.client.send(self.handle, packet))
+        {
             Ok(()) => Ok(TransportOutcome::Accepted),
-            // A definitive refusal is the rejected outcome, never a success.
-            Err(StationError::Rejected { .. }) => Ok(TransportOutcome::Rejected),
-            // After the bounded retry loop the outcome is unknown: the
-            // operation may or may not have committed. That is the ambiguous
-            // outcome, and the already-committed pending item stays durable
-            // for the next re-drive.
-            Err(StationError::Uncertain | StationError::Nonconforming) => {
-                Ok(TransportOutcome::Ambiguous)
-            }
-            // The packet never left the client: the failure is definite, not
-            // uncertain.
-            Err(
-                StationError::InvalidControl
-                | StationError::InvalidOrigin
-                | StationError::Access(_),
-            ) => Err(PortFailure::Unavailable),
+            Err(error) => map_error(error),
+        }
+    }
+}
+
+/// Maps the station exchange onto the port contract. `Ok` reports the
+/// outcome a `submit` must return; `Err` reports a port failure.
+fn map_error(error: StationError) -> Result<TransportOutcome, PortFailure> {
+    match error {
+        StationError::Rejected { .. } => Ok(TransportOutcome::Rejected),
+        StationError::Transient { .. } => Ok(TransportOutcome::Transient),
+        StationError::Ambiguous => Ok(TransportOutcome::Ambiguous),
+        StationError::Superseded
+        | StationError::Revoked
+        | StationError::DeviceMismatch
+        | StationError::Refused
+        | StationError::Protocol
+        | StationError::Io(_) => Err(PortFailure::Unavailable),
+    }
+}
+
+impl Drop for SubmitCarrier {
+    fn drop(&mut self) {
+        // `Runtime::drop` panics inside an async context; the background
+        // shutdown does not block, so it is safe wherever the caller
+        // releases the carrier.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
         }
     }
 }

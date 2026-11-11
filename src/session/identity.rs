@@ -10,9 +10,9 @@
 //!
 //! `state_digest` and the two `key_id`s are caller-owned labels. This
 //! derivation binds them deterministically to the key material, which keeps a
-//! standalone responder's identity stable across restarts. LicoUp derives its
-//! own digests from user-authority state and passes the same `IdentityPublic`
-//! shape in.
+//! standalone responder's identity stable across restarts. A consumer that
+//! derives digests from its own authority state passes the same
+//! `IdentityPublic` shape in.
 
 use std::fs;
 use std::io;

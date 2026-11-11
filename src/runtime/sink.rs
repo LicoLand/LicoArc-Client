@@ -14,8 +14,9 @@ use licoarc::state::{
     AtomicState, KeyCustody, PendingId, PlaintextReceiver, StagedSecretHandle, X25519Private,
 };
 
+use crate::carrier::HandleToken;
 use crate::inbound::{InboundRefusal, InboundSession, TrustFacts};
-use crate::runtime::mailbox::{ConsumeVerdict, PacketSink};
+use crate::runtime::mailbox::{PacketSink, Verdict};
 
 /// Supplies the optional staged bootstrap secret for the next record.
 ///
@@ -112,15 +113,15 @@ where
     S: licoarc::state::AtomicState<licoarc::endpoint::EndpointState>,
     F: FreshPrivate,
 {
-    fn accept(&mut self, packet: &[u8]) -> ConsumeVerdict {
+    fn accept(&mut self, _sequence: u64, _handle: HandleToken, packet: &[u8]) -> Verdict {
         match self.session.receive_record(packet, self.fresh.next()) {
             Ok((facts, pending)) => {
                 self.received.push(Received { facts, pending });
-                ConsumeVerdict::Complete
+                Verdict::Done
             }
             Err(refusal) => {
                 self.refused.push(Refused { refusal });
-                ConsumeVerdict::Release
+                Verdict::Done
             }
         }
     }
@@ -135,9 +136,10 @@ where
 /// pending item only after the caller's boundary reports success. A record
 /// that committed but could not release is still `Complete` — it lives in
 /// the committed pending set and the next drain re-drives it.
-pub struct EndpointSink<'a, R: Role, P, C, S, T> {
+pub struct EndpointSink<'a, R: Role, P, C, S, T, F = NoFreshPrivate> {
     endpoint: &'a mut Endpoint<R, P, C, S>,
     receiver: T,
+    fresh: F,
     received: Vec<PendingId>,
     refused: Vec<Error>,
 }
@@ -155,6 +157,29 @@ where
         Self {
             endpoint,
             receiver,
+            fresh: NoFreshPrivate,
+            received: vec![],
+            refused: vec![],
+        }
+    }
+}
+
+impl<'a, R, P, C, S, T, F> EndpointSink<'a, R, P, C, S, T, F>
+where
+    R: Role,
+    P: Provider,
+    C: KeyCustody,
+    S: AtomicState<EndpointState>,
+    T: PlaintextReceiver,
+    F: FreshPrivate,
+{
+    /// Same as [`EndpointSink::new`] with a staged-bootstrap provider —
+    /// required when the peer rotates its DH key (their first send does).
+    pub fn with_fresh(endpoint: &'a mut Endpoint<R, P, C, S>, receiver: T, fresh: F) -> Self {
+        Self {
+            endpoint,
+            receiver,
+            fresh,
             received: vec![],
             refused: vec![],
         }
@@ -173,16 +198,17 @@ where
     }
 }
 
-impl<R, P, C, S, T> PacketSink for EndpointSink<'_, R, P, C, S, T>
+impl<R, P, C, S, T, F> PacketSink for EndpointSink<'_, R, P, C, S, T, F>
 where
     R: Role,
     P: Provider,
     C: KeyCustody,
     S: AtomicState<EndpointState>,
     T: PlaintextReceiver,
+    F: FreshPrivate,
 {
-    fn accept(&mut self, packet: &[u8]) -> ConsumeVerdict {
-        match self.endpoint.receive_record(packet, None) {
+    fn accept(&mut self, _sequence: u64, _handle: HandleToken, packet: &[u8]) -> Verdict {
+        match self.endpoint.receive_record(packet, self.fresh.next()) {
             Ok(pending) => {
                 self.received.push(pending);
                 // Release is the durable half of the commit: a failed release
@@ -191,11 +217,11 @@ where
                 let _ = self
                     .endpoint
                     .release_pending_plaintext(pending, &mut self.receiver);
-                ConsumeVerdict::Complete
+                Verdict::Done
             }
             Err(error) => {
                 self.refused.push(error);
-                ConsumeVerdict::Release
+                Verdict::Done
             }
         }
     }

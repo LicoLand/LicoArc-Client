@@ -4,7 +4,8 @@
 //! artifact that is not the Candidate leaves every caller-owned port untouched,
 //! and the custody adapter resolves a purpose only through the caller's own
 //! store. The artifact-accepting branch needs the authorized bundle and is
-//! exercised through `licoup_protocol_bindings`' gated cases instead.
+//! exercised by the `#[ignore]`d `LICOARC_AUTHORITY_BUNDLE` cases elsewhere in
+//! this crate instead.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -652,7 +653,8 @@ fn the_state_adapter_forwards_the_old_or_new_decision_and_the_item_itself() {
 /// The replacement composition's own contracts.
 ///
 /// The artifact-accepting branch needs the authorized bundle and the real
-/// ed25519/ml-dsa-65 keys; `licoup_protocol_bindings`' gated cases exercise it.
+/// ed25519/ml-dsa-65 keys; the `#[ignore]`d cases in
+/// `crate::replacement_admission` exercise it.
 /// What is proved here is the part that must hold *without* an artifact: an
 /// unauthorized request is refused in the composition's own terms, before the
 /// SDK, a store, a transport or an effect is reached.

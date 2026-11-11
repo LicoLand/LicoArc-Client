@@ -1,6 +1,6 @@
 //! The caller-owned port spine the fixed SDK's endpoint is composed from.
 //!
-//! LicoUp owns key custody, durable state, time, and packet transport;
+//! The caller owns key custody, durable state, time, and packet transport;
 //! [`crate::ports`] declares exactly those four as
 //! consumer-owned traits, and the pinned LicoArc SDK declares its own
 //! `KeyCustody`, `AtomicState`, `Clock`, and `PacketCarrier` for the same four
@@ -26,9 +26,9 @@
 //!   [`crate::TrustFacts`], whose constructors are private
 //!   and fallible; nothing here can mint, relabel, or edit one.
 //!
-//! The SDK is named through [`licoup_protocol_bindings`] re-exports, so this
-//! crate declares no `licoarc` dependency of its own and the boundary module
-//! stays the single place the fixed SDK is reached.
+//! The SDK is the pinned `licoarc` dependency, re-exported at the crate root
+//! ([`crate::endpoint`], [`crate::state`], and siblings), so this module names
+//! the fixed SDK boundary in `crate::` terms everywhere.
 
 use crate::Error;
 use crate::endpoint::EndpointState;
@@ -606,7 +606,7 @@ impl<C, H, A, K, T> AdmittedProtocolWork<C, H, A, K, T> {
 
 /// Converts one caller-owned failure into the SDK's bounded error vocabulary.
 ///
-/// The split is the SDK's own (`Error::retryable`, `src/error.rs:54-71`): only
+/// The split is the SDK's own (`Error::retryable`, `src/error.rs`): only
 /// an uncertain outcome is retryable, because an uncertain operation must
 /// re-drive the same already-committed item and never a fresh one.
 trait PortFailureIntoError {

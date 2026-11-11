@@ -1,12 +1,11 @@
 //! The composition point between signed-transition verification and the binding.
 //!
-//! Two crates own the two halves of device replacement, and neither may name the
-//! other: [`licoup_protocol_bindings`] holds the fixed-SDK delegation and may
-//! reach no LicoUp crate at all
-//! (`crates/licoup-protocol-bindings/tests/dependency_direction.rs:309-316`),
-//! while [`licoup_endpoint_core`] holds the binding vocabulary and declares no
-//! dependency. This module is where they meet, exactly as the adapters beside it
-//! are where the caller-owned ports meet the SDK's own traits.
+//! Two halves make one device replacement, and neither names the other:
+//! [`crate::replacement_admission`] holds the fixed-SDK delegation, while the
+//! binding vocabulary in [`crate::replacement`] is the caller-owned replacement
+//! contract and declares no SDK types of its own. This module is where they
+//! meet, exactly as the adapters beside it are where the caller-owned ports
+//! meet the SDK's own traits.
 //!
 //! It adds no protocol policy. The SDK alone decides whether the signed
 //! transition, the possession proof and the authenticated session hold; this

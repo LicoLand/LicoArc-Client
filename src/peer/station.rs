@@ -1,10 +1,8 @@
 //! Station-reported transport hints, kept read-only.
 //!
-//! The pinned station adapter already reports exactly these booleans and the
-//! protocol document fixes their meaning: a lease, an acceptance flag, a
-//! duplicate flag, or a deletion acknowledgement is an untrusted transport hint
-//! and cannot establish endpoint evidence
-//! (`docs/protocols/licoarc-station-adapter.md`). This type carries that hint
+//! A station reports exactly these booleans: a lease, an acceptance flag, a
+//! duplicate flag, or a deletion acknowledgement is an untrusted transport
+//! hint and cannot establish endpoint evidence. This type carries that hint
 //! into the peer-message record without ever turning it into a fact.
 
 /// One station-reported delivery hint.

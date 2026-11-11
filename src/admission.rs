@@ -4,8 +4,8 @@
 //! belong to LicoArc and its Rust SDK. This crate owns only the caller-side
 //! boundary: it hands the caller's exact bytes to the SDK and accepts only what
 //! the SDK verifies as the fixed Candidate. There is no second parser, no
-//! project-level digest gate, and no line that LicoUp can mint, patch, or
-//! extrapolate on its own.
+//! crate-level digest gate, and no line this crate or its caller can mint,
+//! patch, or extrapolate on its own.
 
 use core::fmt;
 
@@ -37,7 +37,7 @@ impl<'a> AuthorityInput<'a> {
     /// generation, Candidate lifecycle, complete definition, session
     /// eligibility, absent publication eligibility, source closure, and content
     /// address. Any other input — unknown, incomplete, mutated, or a different
-    /// line — is refused here, before LicoUp writes or sends anything.
+    /// line — is refused here, before the caller writes or sends anything.
     pub fn admit(self) -> Result<VerifiedProtocolLine, AdmissionRefusal> {
         AuthorityBundle::new(self.bytes)
             .admit()
@@ -47,8 +47,8 @@ impl<'a> AuthorityInput<'a> {
 
 /// Refused authority artifact.
 ///
-/// One stable LicoUp code, plus the SDK's bounded cause. It never carries input
-/// bytes, payloads, secrets, or paths.
+/// One stable caller-facing code, plus the SDK's bounded cause. It never
+/// carries input bytes, payloads, secrets, or paths.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdmissionRefusal {
     cause: Error,
@@ -59,7 +59,7 @@ impl AdmissionRefusal {
         Self { cause }
     }
 
-    /// Stable LicoUp code for every refused artifact.
+    /// Stable code for every refused artifact.
     #[must_use]
     pub const fn code(self) -> &'static str {
         AUTHORIZATION_REQUIRED

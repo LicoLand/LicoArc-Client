@@ -20,6 +20,8 @@
 //! * [`peer`] maps verified SDK units into peer-facing messages without
 //!   promoting station hints into endpoint evidence.
 
+#![forbid(unsafe_code)]
+
 pub mod adapters;
 pub mod admission;
 pub mod authority;
@@ -48,10 +50,8 @@ pub use authority::{
     OperationPolicy,
 };
 pub use carrier::{
-    AffiliateAccepted, AffiliateRequest, CarrierConfig, ClaimAccepted, ClaimRequest, FailureClass,
-    HandleClass, HandleToken, ItemResult, OperationId, OperationOutcome, ReserveAccepted,
-    ReserveRequest, RetrieveRequest, SettleAction, SettleOutcome, SettleRequest, Settlement,
-    StationClient, StationError, SubmitCarrier,
+    Credentials, CredentialsError, Event, HandleToken, MailboxClient, SUBPROTOCOL, StationError,
+    SubmitCarrier, TokenRefusal,
 };
 pub use durable_obligation::{
     AdmittedObligation, DEFAULT_PRE_ADMISSION_BUDGET_BYTES,
@@ -80,9 +80,8 @@ pub use replacement_admission::{
     VerifiedReplacementAuthority,
 };
 pub use runtime::{
-    Carrier, ConsumeVerdict, DrainReport, EndpointSink, FreshPrivate, HandleCarrier, Mailbox,
-    NoFreshPrivate, PacketSink, PendingWork, PollPace, PollReport, PumpReport, Received, Refused,
-    SessionSink, drain_pending, poll_loop,
+    DrainReport, EndpointSink, FreshPrivate, LoopExit, NoFreshPrivate, PacketSink, PendingWork,
+    Received, Refused, SessionSink, Spool, Verdict, drain_pending, receive_loop,
 };
 pub use session::{
     EnvelopeRefusal, FileState, InitiatorDrive, LocalIdentity, MintRefusal, OfferRefusal,
@@ -97,7 +96,7 @@ pub use version::{
 /// Fixed-revision SDK traits and state used by the endpoint adapters.
 /// Caller port contracts remain SDK-free; adapters consume the same pinned
 /// boundary.
-pub use licoarc::{endpoint, provider, state};
+pub use licoarc::{endpoint, identity, provider, reliable, state};
 
 pub use licoarc::artifact::{AuthorityBundle, VerifiedProtocolLine};
 pub use licoarc::error::{Error, ErrorCode, Stage};

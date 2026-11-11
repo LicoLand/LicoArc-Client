@@ -1,38 +1,34 @@
 //! Device replacement authority through the pinned SDK's own verification entries.
 //!
-//! This is the client-side consumer of the LicoArc stable-core replacement
+//! This is the client-side consumer of the pinned `licoarc` SDK's replacement
 //! surface. It never decides a protocol outcome: it calls the SDK entry that
 //! owns the decision and hands back exactly what that entry verified. Every rule
-//! below names the SDK behaviour it mirrors, read at revision
-//! `244ce7186cac1690c18f091dbe02df36a0860ef4`.
+//! below names the SDK behaviour it mirrors (`src/...` paths inside the
+//! `licoarc` package).
 //!
 //! # What the SDK owns
 //!
 //! | decision | SDK entry |
 //! | --- | --- |
-//! | the signed management/recovery transition, its epoch and its predecessor | `validate_user_authority_state`, `src/identity.rs:129-311` |
-//! | the new-device possession proof | reached inside the same entry, `src/identity.rs:286-302` |
-//! | the replacement possession proof over the new authority keys | same entry, `src/identity.rs:593-638`; the message is `replacement_possession_input`, `src/identity.rs:111-127` |
-//! | the authenticated session, its authority digest and its active device entry | `admit_protected_authority_payload`, `src/identity.rs:351-406` |
+//! | the signed management/recovery transition, its epoch and its predecessor | `validate_user_authority_state`, `src/identity.rs` |
+//! | the new-device possession proof | reached inside the same entry, `src/identity.rs` |
+//! | the replacement possession proof over the new authority keys | same entry, `src/identity.rs`; the message is `replacement_possession_input`, `src/identity.rs` |
+//! | the authenticated session, its authority digest and its active device entry | `admit_protected_authority_payload`, `src/identity.rs` |
 //!
 //! Nothing here re-verifies a signature and no local type mirrors an SDK type:
 //! the adapter calls [`licoarc::identity::admit_protected_authority_payload`] and
 //! returns the SDK's own [`AcceptedUserAuthority`]. `verify_replacement_possession`
-//! is private in the SDK (`src/identity.rs:593`) and is deliberately *not*
+//! is private in the SDK (`src/identity.rs`) and is deliberately *not*
 //! re-implemented here; it is reached only through the two public entries above.
 //!
 //! # Why the binding lives elsewhere
 //!
 //! The SDK verifies that *some* subject's roster accepted *some* device. It
 //! cannot know which replacement the local person asked for, which source device
-//! it replaces, or which operation it performs. That comparison is
-//! `licoup_endpoint_core::replacement`, whose vocabulary has no dependencies at
-//! all, and the platform adapter that composes both sides is
-//! `licoup_native::domain::mobile_relay::endpoint_ports`. This crate may not
-//! reach either of them: the lane's direction is
-//! `platform adapter → protocol bindings → fixed SDK`
-//! (`tests/dependency_direction.rs:22-27`). Keeping the SDK delegation here and
-//! the binding there is what makes that direction hold.
+//! it replaces, or which operation it performs. That comparison is the
+//! caller-owned binding contract in [`crate::replacement`] — vocabulary with no
+//! SDK dependencies at all — and the replacement adapter in [`crate::adapters`]
+//! is where the two sides are composed.
 //!
 //! # No side effect before admitted authority
 //!
@@ -56,7 +52,7 @@ use crate::VerifiedProtocolLine;
 ///
 /// The SDK matches a roster entry on `endpointIdentityRef` **and**
 /// `identityStateDigest`, then verifies that entry's possession proof against
-/// these keys (`src/identity.rs:254-269`). Supplying the wrong digest or the
+/// these keys (`src/identity.rs`). Supplying the wrong digest or the
 /// wrong keys therefore fails closed inside the SDK.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplacementEndpointKeys {
@@ -109,7 +105,7 @@ impl ReplacementEndpointKeys {
 /// It is passed through to the SDK unchanged as `accepted`. The transition rules
 /// that make it required — epoch `n + 1`, matching
 /// `previousUserAuthorityStateDigest`, equal `userIdentityRef` and
-/// `protocolLineId` — belong to the SDK (`src/identity.rs:169-207`).
+/// `protocolLineId` — belong to the SDK (`src/identity.rs`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplacementPredecessor {
     authority: AcceptedUserAuthority,
@@ -158,7 +154,7 @@ impl ReplacementPredecessor {
 /// the call when `authenticated` is false, when the payload digest differs from
 /// `authority_state_digest`, or when the session's
 /// `(endpoint_identity_ref, identity_state_digest)` is not an active authorized
-/// device (`src/identity.rs:359-404`).
+/// device (`src/identity.rs`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplacementSession {
     /// Whether the SDK authenticated this session.
@@ -223,7 +219,7 @@ pub enum ReplacementAdmissionRefusal {
     NoAdmittedLine,
     /// The SDK refused the signed transition, the possession proof, or the
     /// authenticated session it was presented on
-    /// (`src/identity.rs:129-311`, `:351-406`).
+    /// (`src/identity.rs`).
     VerificationRefused,
     /// A caller-supplied key set or record field was not readable in the shape
     /// the SDK requires.
@@ -428,13 +424,14 @@ mod tests {
     //!
     //! The record shape, the two-pass signing order and the replacement
     //! possession proof all mirror the SDK's own conformance fixture
-    //! (`licoarc-rust src/conformance/executor.rs:465-630`, `:1724-1772`). None
+    //! (`src/conformance/executor.rs` in the `licoarc` package). None
     //! of it is a second verifier: every assertion below is made about what
     //! `admit_protected_authority_payload` decided.
     //!
-    //! The artifact-dependent cases are `#[ignore]`, exactly as
-    //! `tests/endpoint_consumer.rs` does, so an absent authorized bundle is
-    //! reported as not run instead of passing silently.
+    //! The artifact-dependent cases are `#[ignore]`d on
+    //! `LICOARC_AUTHORITY_BUNDLE`, exactly like the gated cases in
+    //! `crate::session::drive`, so an absent authorized bundle is reported as
+    //! not run instead of passing silently.
 
     use std::{env, fs};
 
@@ -484,7 +481,7 @@ mod tests {
     }
 
     /// Mirrors the SDK's own `authority_pair`
-    /// (`src/conformance/executor.rs:521-549`).
+    /// (`src/conformance/executor.rs`).
     fn pair(provider: &impl Provider, purpose: &'static str, marker: u8) -> Pair {
         let ed25519_seed = seed(provider, b"ed25519", marker);
         let ml_dsa_65_seed = seed(provider, b"ml-dsa-65", marker);
@@ -515,7 +512,7 @@ mod tests {
     }
 
     /// Mirrors the SDK's own `placeholder_authority_signatures`
-    /// (`src/conformance/executor.rs:551-566`). The digest covers the signature
+    /// (`src/conformance/executor.rs`). The digest covers the signature
     /// array, so the record needs its final shape before it is signed.
     fn placeholder_signatures(pair: &Pair, purpose: &str) -> Vec<Value> {
         vec![
@@ -556,7 +553,7 @@ mod tests {
         ]
     }
 
-    /// The SDK's own two-pass signing recipe (`src/conformance/executor.rs:590-601`).
+    /// The SDK's own two-pass signing recipe (`src/conformance/executor.rs`).
     fn sign_state(
         provider: &impl Provider,
         state: &mut Value,
@@ -569,7 +566,7 @@ mod tests {
         Ok(())
     }
 
-    /// The SDK's own successor skeleton (`src/conformance/executor.rs:603-630`).
+    /// The SDK's own successor skeleton (`src/conformance/executor.rs`).
     fn successor_skeleton(
         provider: &impl Provider,
         previous: &Value,
@@ -624,7 +621,7 @@ mod tests {
     /// One genesis record, its accepted authority, and the devices it names.
     ///
     /// The record's `protocolLineId` is this build's own pinned line id, because
-    /// the SDK refuses any other (`src/identity.rs:142-144`).
+    /// the SDK refuses any other (`src/identity.rs`).
     struct Fixture {
         genesis: Value,
         accepted: AcceptedUserAuthority,
@@ -702,7 +699,7 @@ mod tests {
     }
 
     /// The recovery-transition replacement the SDK's own suite builds
-    /// (`src/conformance/executor.rs:1724-1772`). This is a *key* replacement:
+    /// (`src/conformance/executor.rs`). This is a *key* replacement:
     /// the recovery key authorizes new management and recovery key sets, and the
     /// new keys prove possession over the new record.
     fn replacement_transition(provider: &impl Provider, fixture: &Fixture) -> Value {

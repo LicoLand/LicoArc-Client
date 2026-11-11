@@ -4,10 +4,10 @@
 //! exposes four fields that together identify the exact accepted Line, and every
 //! one of them is part of the acceptance:
 //!
-//! * `wire_id` — `VerifiedProtocolLine::wire_id`, `licoarc-rust/src/artifact/mod.rs:104-107`
-//! * `generation` — `VerifiedProtocolLine::generation`, `src/artifact/mod.rs:109-112`
-//! * `protocol_line_id` — `VerifiedProtocolLine::protocol_line_id`, `src/artifact/mod.rs:119-122`
-//! * `protection_profile_id` — `VerifiedProtocolLine::protection_profile_id`, `src/artifact/mod.rs:124-127`
+//! * `wire_id` — `VerifiedProtocolLine::wire_id`, `src/artifact/mod.rs`
+//! * `generation` — `VerifiedProtocolLine::generation`, `src/artifact/mod.rs`
+//! * `protocol_line_id` — `VerifiedProtocolLine::protocol_line_id`, `src/artifact/mod.rs`
+//! * `protection_profile_id` — `VerifiedProtocolLine::protection_profile_id`, `src/artifact/mod.rs`
 //!
 //! This client accepts exactly one Line identity, frozen in [`AcceptedVersion::fixed`]
 //! from the same fixed Candidate the SDK verifies. A Line that does not match is
@@ -28,12 +28,12 @@ use licoarc::artifact::VerifiedProtocolLine;
 pub const ACCEPTED_WIRE_ID: &str = "licoarc.protocol-line.v1";
 /// The one Line generation this client accepts.
 pub const ACCEPTED_GENERATION: u64 = 1;
-/// The fixed Candidate Line identity (`src/artifact/mod.rs:40`), as bytes.
+/// The fixed Candidate Line identity (`src/artifact/mod.rs`), as bytes.
 pub const ACCEPTED_PROTOCOL_LINE_ID: [u8; 32] = [
-    0xc0, 0xb6, 0x4d, 0x71, 0x86, 0x5c, 0xe9, 0x72, 0xa9, 0x44, 0xdb, 0x3d, 0x31, 0xa1, 0x8c, 0xb0,
-    0x33, 0x95, 0x30, 0x0f, 0x3e, 0xd0, 0x06, 0xc2, 0x1e, 0x64, 0x42, 0x91, 0x78, 0xc2, 0x3a, 0x08,
+    0xe4, 0x19, 0x20, 0x80, 0x8f, 0x71, 0x67, 0xbd, 0x22, 0xe4, 0x33, 0xeb, 0xe6, 0x70, 0x25, 0x7a,
+    0x42, 0xce, 0xd0, 0xd0, 0xbc, 0x4e, 0x4f, 0xdc, 0x16, 0xbe, 0x63, 0xa2, 0x34, 0x6e, 0xbf, 0x18,
 ];
-/// The fixed Candidate protection profile (`src/artifact/mod.rs:41-42`), as bytes.
+/// The fixed Candidate protection profile (`src/artifact/mod.rs`), as bytes.
 pub const ACCEPTED_PROTECTION_PROFILE_ID: [u8; 32] = [
     0x4b, 0x7d, 0x57, 0x5f, 0x39, 0x78, 0x62, 0xf9, 0x03, 0x1e, 0x44, 0xb7, 0x16, 0x92, 0x1e, 0x86,
     0xc4, 0x10, 0xb5, 0xfa, 0xcf, 0x37, 0x9b, 0xde, 0x21, 0x95, 0x59, 0x22, 0xb0, 0xd5, 0x8a, 0x17,
@@ -95,7 +95,7 @@ impl ProtocolVersion {
     ///
     /// The SDK checks it too: a user authority state naming another line is
     /// refused with `AuthorizationFailed`
-    /// (`src/identity.rs:145-147`).
+    /// (`src/identity.rs`).
     #[must_use]
     pub const fn protocol_line_id(&self) -> [u8; 32] {
         self.protocol_line_id

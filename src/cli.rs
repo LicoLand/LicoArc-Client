@@ -1,34 +1,23 @@
 //! The standalone `licoarc-client` command line.
 //!
-//! This slice exposes the carrier directly — the honest minimal loop two
-//! processes can close over one Station without an endpoint session:
+//! This slice exposes the carrier directly — the minimal loop two
+//! processes can close over one Station without an endpoint session.
+//!
+//! Commands drive both the endpoint lifecycle and the mailbox transport:
 //!
 //! ```text
-//! licoarc-client affiliate --station URL --descriptor HEX64 --commitment HEX64
-//! licoarc-client reserve   --station URL --descriptor HEX64 --commitment HEX64 [--class async|first-contact]
-//! licoarc-client send      --station URL --handle TOKEN [--file PATH|-]
-//! licoarc-client poll      --station URL --handle TOKEN --out DIR|- [--max N]
-//! licoarc-client daemon    --station URL --handle TOKEN --out DIR|--out - [--idle MS]
-//! ```
-//!
-//! Every command needs the caller's own inputs: the Station publishes its
-//! descriptor digest out-of-band, the caller chooses and keeps its
-//! affiliation commitment, and the handle comes from `reserve` or from the
-//! peer. Nothing is searched, synthesized, or defaulted to a built-in
-//! Station.
-//!
-//! Endpoint-session commands drive the pairing handshake and established
-//! record flow over the same carrier; pairing envelopes still travel through
-//! `send`/`poll` on caller-reserved handles:
-//!
-//! ```text
-//! licoarc-client init        --dir DIR --authority BUNDLE
-//! licoarc-client offer       --dir DIR --authority BUNDLE --handle TOKEN --sequence N [--from T] [--until T] --authority-digest HEX64 [--out FILE|-]
-//! licoarc-client begin       --dir DIR --authority BUNDLE --offer FILE|- --reply-handle TOKEN --authority-digest HEX64 [--out FILE|-]
-//! licoarc-client accept      --dir DIR --authority BUNDLE --peer FILE --authority-digest HEX64 --session-handle TOKEN [--in FILE|-] [--out FILE|-]
-//! licoarc-client finish      --dir DIR --authority BUNDLE [--in FILE|-]
-//! licoarc-client record-send --dir DIR --role responder|initiator --authority BUNDLE --station URL --handle TOKEN [--file PATH|-] [--ca PATH]
-//! licoarc-client record-poll --dir DIR --role responder|initiator --authority BUNDLE --station URL --handle TOKEN --out DIR|- [--max N] [--ca PATH]
+//! licoarc-client enroll --station URL --invitation-file PATH --credentials FILE [--ca PATH]
+//! licoarc-client handle --credentials FILE
+//! licoarc-client send --credentials FILE --handle TOKEN [--file PATH|-] [--ca PATH]
+//! licoarc-client receive --credentials FILE --spool DIR [--follow] [--ca PATH]
+//! licoarc-client init --dir DIR --authority BUNDLE
+//! licoarc-client offer --dir DIR --authority BUNDLE --handle TOKEN --sequence N [--from T] [--until T] --authority-digest HEX64 [--out FILE|-]
+//! licoarc-client begin --dir DIR --authority BUNDLE --offer FILE|- --reply-handle TOKEN --authority-digest HEX64 [--out FILE|-]
+//! licoarc-client accept --dir DIR --authority BUNDLE --peer FILE --authority-digest HEX64 --session-handle TOKEN [--in FILE|-] [--out FILE|-]
+//! licoarc-client finish --dir DIR --authority BUNDLE [--in FILE|-]
+//! licoarc-client dispatch --dir DIR --role responder|initiator --authority BUNDLE --credentials FILE --handle TOKEN [--out DIR] [--ca PATH]
+//! licoarc-client record-send --dir DIR --role responder|initiator --authority BUNDLE --credentials FILE --handle TOKEN [--file PATH|-] [--ca PATH]
+//! licoarc-client record-read --dir DIR --role responder|initiator --authority BUNDLE --spool DIR --handle TOKEN --out DIR
 //! ```
 //!
 //! One `--dir` is one endpoint in one role: `custody.index`,
@@ -36,34 +25,24 @@
 //! `endpoint.checkpoint` live there, so every command resumes exactly where
 //! the last one committed.
 //!
-//! `--ca PATH` adds one trust root (PEM or DER) for locally operated Stations
-//! with development certificates; production listeners validate against the
+//! `--ca PATH` adds one trust root (PEM) for locally operated Stations with
+//! development certificates; production listeners validate against the
 //! system verifier.
 //!
-//! `--access FILE` attaches one BadTower access grant (written by `exchange`)
-//! to every Station request: the `bta2` capability plus a freshly numbered
-//! Ed25519 request proof. Stations without capability admission simply run
-//! without it.
-
 use licoarc::provider::{DigestProvider, RustCryptoProvider};
 use licoarc::state::PlaintextReceiver;
 use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::adapters::PacketCarrierAdapter;
-use crate::carrier::{
-    AffiliateRequest, CarrierConfig, HandleClass, HandleToken, ReserveRequest, StationClient,
-    StationError, SubmitCarrier, TRANSPORT_PROFILE_DIGEST,
-};
+use crate::carrier::{Credentials, Event, HandleToken, MailboxClient, StationError, SubmitCarrier};
 use crate::inbound::EndpointConsumer;
 use crate::ports::Clock;
 use crate::providers::FileCustody;
 use crate::runtime::{
-    ConsumeVerdict, EndpointSink, HandleCarrier, Mailbox, PacketSink, PollPace, drain_pending,
-    poll_loop,
+    EndpointSink, LoopExit, PacketSink, Spool, Verdict, drain_pending, receive_loop,
 };
 use crate::session::{
     InitiatorDrive, LocalIdentity, PairingOffer, ResponderDrive, StaticTrust, SystemClock,
@@ -97,7 +76,10 @@ pub fn run(arguments: &[String], out: &mut impl Write, err: &mut impl Write) -> 
     if options.flag("help") {
         return usage(err);
     }
-    let runtime = match tokio::runtime::Builder::new_current_thread()
+    // Multi-thread so the spawned mailbox io_loop keeps advancing while the
+    // protocol thread blocks inside SubmitCarrier's private runtime.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
     {
@@ -119,7 +101,7 @@ pub fn run(arguments: &[String], out: &mut impl Write, err: &mut impl Write) -> 
 
 fn usage(err: &mut impl Write) -> Exit {
     let _ = err.write_all(
-        b"usage:\n  licoarc-client exchange --station URL (--invitation TOKEN|--invitation-file PATH) --access FILE [--ca PATH]\n  licoarc-client affiliate --station URL --descriptor HEX64 --commitment HEX64 [--ca PATH] [--access FILE]\n  licoarc-client reserve --station URL --descriptor HEX64 --commitment HEX64 [--class async|first-contact] [--ca PATH] [--access FILE]\n  licoarc-client send --station URL --handle TOKEN [--file PATH|-] [--ca PATH] [--access FILE]\n  licoarc-client poll --station URL --handle TOKEN --out DIR|--out - [--max N] [--ca PATH] [--access FILE]\n  licoarc-client daemon --station URL --handle TOKEN --out DIR|--out - [--idle MS] [--ca PATH] [--access FILE]\n  licoarc-client init --dir DIR --authority BUNDLE\n  licoarc-client offer --dir DIR --authority BUNDLE --handle TOKEN --sequence N [--from T] [--until T] --authority-digest HEX64 [--out FILE|-]\n  licoarc-client begin --dir DIR --authority BUNDLE --offer FILE|- --reply-handle TOKEN --authority-digest HEX64 [--out FILE|-]\n  licoarc-client accept --dir DIR --authority BUNDLE --peer FILE --authority-digest HEX64 --session-handle TOKEN [--in FILE|-] [--out FILE|-]\n  licoarc-client finish --dir DIR --authority BUNDLE [--in FILE|-]\n  licoarc-client dispatch --dir DIR --role responder|initiator --authority BUNDLE --station URL --handle TOKEN [--out DIR] [--ca PATH] [--access FILE]\n  licoarc-client record-send --dir DIR --role responder|initiator --authority BUNDLE --station URL --handle TOKEN [--file PATH|-] [--ca PATH] [--access FILE]\n  licoarc-client record-poll --dir DIR --role responder|initiator --authority BUNDLE --station URL --handle TOKEN --out DIR|- [--max N] [--ca PATH] [--access FILE]\n",
+        b"usage:\n  licoarc-client enroll --station URL --invitation-file PATH --credentials FILE [--ca PATH]\n  licoarc-client handle --credentials FILE\n  licoarc-client send --credentials FILE --handle TOKEN [--file PATH|-] [--ca PATH]\n  licoarc-client receive --credentials FILE --spool DIR [--follow] [--ca PATH]\n  licoarc-client init --dir DIR --authority BUNDLE\n  licoarc-client offer --dir DIR --authority BUNDLE --handle TOKEN --sequence N [--from T] [--until T] --authority-digest HEX64 [--out FILE|-]\n  licoarc-client begin --dir DIR --authority BUNDLE --offer FILE|- --reply-handle TOKEN --authority-digest HEX64 [--out FILE|-]\n  licoarc-client accept --dir DIR --authority BUNDLE --peer FILE --authority-digest HEX64 --session-handle TOKEN [--in FILE|-] [--out FILE|-]\n  licoarc-client finish --dir DIR --authority BUNDLE [--in FILE|-]\n  licoarc-client dispatch --dir DIR --role responder|initiator --authority BUNDLE --credentials FILE --handle TOKEN [--out DIR] [--ca PATH]\n  licoarc-client record-send --dir DIR --role responder|initiator --authority BUNDLE --credentials FILE --handle TOKEN [--file PATH|-] [--ca PATH]\n  licoarc-client record-read --dir DIR --role responder|initiator --authority BUNDLE --spool DIR --handle TOKEN --out DIR\n",
     );
     Exit::USAGE
 }
@@ -170,51 +152,29 @@ impl Options {
     }
 }
 
-fn station_client(options: &Options) -> Result<Arc<StationClient>, String> {
-    client(options).map(Arc::new)
+fn credentials_path(options: &Options) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(options.require("credentials")?))
 }
 
-fn client(options: &Options) -> Result<StationClient, String> {
-    let mut config = carrier_config(options)?;
-    if let Some(path) = options.optional("access") {
-        config.access_credentials = Some(PathBuf::from(path));
-    }
-    StationClient::new(config).map_err(|error| error.to_string())
+fn credentials(options: &Options) -> Result<Credentials, String> {
+    let path = credentials_path(options)?;
+    Credentials::load(&path).map_err(|error| format!("--credentials: {error}"))
 }
 
-fn carrier_config(options: &Options) -> Result<CarrierConfig, String> {
-    let mut config = CarrierConfig {
-        origin: options.require("station")?,
-        ..CarrierConfig::default()
-    };
-    if let Some(path) = options.optional("ca") {
-        let bytes = std::fs::read(path).map_err(|error| format!("--ca {path}: {error}"))?;
-        let certificate = reqwest::Certificate::from_pem(&bytes)
-            .or_else(|_| reqwest::Certificate::from_der(&bytes))
-            .map_err(|error| format!("--ca {path}: {error}"))?;
-        config.extra_root_certificates.push(certificate);
-    }
-    Ok(config)
+fn extra_roots(options: &Options) -> Result<Vec<PathBuf>, String> {
+    Ok(match options.optional("ca") {
+        Some(path) => vec![PathBuf::from(path)],
+        None => vec![],
+    })
 }
 
-fn invitation(options: &Options) -> Result<String, String> {
-    if let Some(text) = options.optional("invitation") {
-        return Ok(text.to_owned());
-    }
-    if let Some(path) = options.optional("invitation-file") {
-        return std::fs::read_to_string(path)
-            .map(|text| text.trim().to_owned())
-            .map_err(|error| format!("--invitation-file {path}: {error}"));
-    }
-    Err("--invitation TOKEN or --invitation-file PATH is required".to_owned())
-}
-
-fn descriptor(options: &Options) -> Result<[u8; 32], String> {
-    hex32(&options.require("descriptor")?)
-}
-
-fn commitment(options: &Options) -> Result<[u8; 32], String> {
-    hex32(&options.require("commitment")?)
+/// Connects one mailbox client from `--credentials` (and optional `--ca`).
+fn connect(options: &Options, rt: &tokio::runtime::Runtime) -> Result<Arc<MailboxClient>, String> {
+    let credentials = credentials(options)?;
+    let roots = extra_roots(options)?;
+    rt.block_on(MailboxClient::connect(&credentials, &roots))
+        .map(Arc::new)
+        .map_err(station_error)
 }
 
 fn handle(options: &Options) -> Result<HandleToken, String> {
@@ -264,89 +224,55 @@ fn dispatch(
     out: &mut impl Write,
 ) -> Result<(), String> {
     match command {
-        "exchange" => {
-            // `--access` names the file the grant is written to; nothing is
-            // loaded from it before the exchange commits.
-            let config = carrier_config(options)?;
-            let client = StationClient::new(config).map_err(|error| error.to_string())?;
-            let store = PathBuf::from(options.require("access")?);
-            let grant = rt
-                .block_on(client.exchange_invitation(&invitation(options)?, store))
+        "enroll" => {
+            let invitation_path = options.require("invitation-file")?;
+            let token = std::fs::read_to_string(&invitation_path)
+                .map_err(|error| format!("--invitation-file {invitation_path}: {error}"))?
+                .trim()
+                .to_owned();
+            let path = credentials_path(options)?;
+            let credentials = Credentials::mint(options.require("station")?, token, path.clone())
+                .map_err(|error| format!("credentials: {error}"))?;
+            let roots = extra_roots(options)?;
+            let client = rt
+                .block_on(MailboxClient::connect(&credentials, &roots))
                 .map_err(station_error)?;
-            writeln!(
-                out,
-                "{{\"expiresAt\":{}}}",
-                grant
-                    .expires_at()
-                    .map_or_else(|| "null".to_owned(), |text| format!("\"{text}\""))
-            )
-            .map_err(|error| error.to_string())
+            let mut credentials = credentials;
+            credentials
+                .bind_mailbox(client.mailbox_id())
+                .map_err(|error| format!("credentials: {error}"))?;
+            let handle = credentials
+                .mailbox_id()
+                .ok_or_else(|| "station did not bind a mailbox".to_owned())
+                .and_then(|id| HandleToken::mint(id).map_err(|error| error.to_string()))?;
+            writeln!(out, "{{\"handle\":\"{}\"}}", handle.as_text())
+                .map_err(|error| error.to_string())
         }
-        "affiliate" => {
-            let client = station_client(options)?;
-            let accepted = rt
-                .block_on(client.affiliate(&AffiliateRequest {
-                    station_descriptor_digest: descriptor(options)?,
-                    affiliation_commitment: commitment(options)?,
-                }))
-                .map_err(station_error)?;
-            writeln!(
-                out,
-                "{{\"notAfter\":{},\"signature\":\"{}\"}}",
-                accepted.not_after,
-                hex(&accepted.signature)
-            )
-            .map_err(|error| error.to_string())
-        }
-        "reserve" => {
-            let client = station_client(options)?;
-            let handle_class = match options.optional("class").unwrap_or("async") {
-                "async" => HandleClass::Async,
-                "first-contact" => HandleClass::FirstContact,
-                other => return Err(format!("unknown --class {other}")),
-            };
-            let accepted = rt
-                .block_on(client.reserve(&ReserveRequest {
-                    station_descriptor_digest: descriptor(options)?,
-                    affiliation_commitment: commitment(options)?,
-                    transport_profile_digest: TRANSPORT_PROFILE_DIGEST,
-                    handle_class,
-                }))
-                .map_err(station_error)?;
-            let (service_until, signature) = accepted.service.map_or(
-                ("null".to_owned(), "null".to_owned()),
-                |(until, signature)| (until.to_string(), format!("\"{}\"", hex(&signature))),
-            );
-            writeln!(
-                out,
-                "{{\"handle\":\"{}\",\"class\":\"{}\",\"serviceUntil\":{},\"signature\":{}}}",
-                accepted.handle.as_text(),
-                match accepted.handle_class {
-                    HandleClass::Async => "async",
-                    HandleClass::FirstContact => "first-contact",
-                },
-                service_until,
-                signature
-            )
-            .map_err(|error| error.to_string())
+        "handle" => {
+            let credentials = credentials(options)?;
+            let handle = credentials
+                .mailbox_id()
+                .ok_or_else(|| "credentials have no bound mailbox yet".to_owned())
+                .and_then(|id| HandleToken::mint(id).map_err(|error| error.to_string()))?;
+            writeln!(out, "{{\"handle\":\"{}\"}}", handle.as_text())
+                .map_err(|error| error.to_string())
         }
         "send" => {
-            let client = station_client(options)?;
+            let client = connect(options, rt)?;
             let packet = read_packet(options)?;
-            rt.block_on(client.submit(handle(options)?, &packet))
+            rt.block_on(client.send(handle(options)?, &packet))
                 .map_err(station_error)?;
             writeln!(out, "{{\"submitted\":true}}").map_err(|error| error.to_string())
         }
-        "poll" => poll(station_client(options)?, options, rt, out),
-        "daemon" => daemon(station_client(options)?, options, rt, out),
+        "receive" => receive(options, rt, out),
         "init" => init(options, out),
         "offer" => offer(options, out),
         "begin" => begin(options, out),
         "accept" => accept(options, out),
         "finish" => finish(options, out),
-        "dispatch" => flush_pending(station_client(options)?, options, out),
-        "record-send" => record_send(station_client(options)?, options, out),
-        "record-poll" => record_poll(station_client(options)?, options, rt, out),
+        "dispatch" => flush_pending(options, rt, out),
+        "record-send" => record_send(options, rt, out),
+        "record-read" => record_read(options, out),
         other => Err(format!("unknown command {other}")),
     }
 }
@@ -364,48 +290,6 @@ fn read_packet(options: &Options) -> Result<Vec<u8>, String> {
     }
 }
 
-/// The caller-visible packet consumer: each claimed packet is written exactly
-/// once — to `dir/<content-digest>.packet`, or raw to the command's writer —
-/// then completed. A failed write releases the item so the next claim can
-/// retry it.
-struct FileSink<'a> {
-    dir: Option<PathBuf>,
-    out: &'a mut dyn Write,
-}
-
-impl FileSink<'_> {
-    fn new(dir: Option<PathBuf>, out: &mut dyn Write) -> FileSink<'_> {
-        FileSink { dir, out }
-    }
-
-    fn write_packet(&mut self, packet: &[u8]) -> std::io::Result<()> {
-        match &self.dir {
-            Some(dir) => {
-                std::fs::create_dir_all(dir)?;
-                let digest = licoarc::provider::fixed_provider().sha256(packet);
-                std::fs::write(dir.join(format!("{}.packet", hex(&digest))), packet)
-            }
-            None => self.out.write_all(packet),
-        }
-    }
-}
-
-impl PacketSink for FileSink<'_> {
-    fn accept(&mut self, packet: &[u8]) -> ConsumeVerdict {
-        match self.write_packet(packet) {
-            Ok(()) => ConsumeVerdict::Complete,
-            Err(_) => ConsumeVerdict::Release,
-        }
-    }
-}
-
-fn sink_dir(options: &Options) -> Result<Option<PathBuf>, String> {
-    match options.require("out")?.as_str() {
-        "-" => Ok(None),
-        path => Ok(Some(PathBuf::from(path))),
-    }
-}
-
 /// Optional `--out`: absent means plaintexts go to the command's own writer.
 fn optional_sink_dir(options: &Options) -> Option<PathBuf> {
     match options.optional("out").unwrap_or("-") {
@@ -414,71 +298,55 @@ fn optional_sink_dir(options: &Options) -> Option<PathBuf> {
     }
 }
 
-fn poll(
-    client: Arc<StationClient>,
+/// Receives deliveries into the local spool. Without `--follow` it drains
+/// until the Station reports the mailbox empty; with `--follow` it keeps
+/// the lane until SIGINT or a terminal error.
+fn receive(
     options: &Options,
     rt: &tokio::runtime::Runtime,
     out: &mut impl Write,
 ) -> Result<(), String> {
-    let handle = handle(options)?;
-    let max_items = options.optional("max").map_or(Ok(16_u64), |text| {
-        text.parse::<u64>().map_err(|_| "invalid --max".to_owned())
-    })?;
-    let mailbox = Mailbox::new(HandleCarrier::new(client, handle), max_items);
-    let mut sink = FileSink::new(sink_dir(options)?, out);
-    let report = rt
-        .block_on(mailbox.pump(&mut sink))
-        .map_err(station_error)?;
-    let outcomes = report
-        .results
-        .iter()
-        .map(|result| result.outcome as u64)
-        .collect::<Vec<_>>();
-    writeln!(
-        out,
-        "{{\"claimed\":{},\"settled\":{},\"outcomes\":{:?}}}",
-        report.claimed, report.settled, outcomes
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn daemon(
-    client: Arc<StationClient>,
-    options: &Options,
-    rt: &tokio::runtime::Runtime,
-    out: &mut impl Write,
-) -> Result<(), String> {
-    let handle = handle(options)?;
-    let idle = options.optional("idle").map_or(Ok(1_000_u64), |text| {
-        text.parse::<u64>().map_err(|_| "invalid --idle".to_owned())
-    })?;
-    let mailbox = Mailbox::new(HandleCarrier::new(client, handle), 16);
-    let mut sink = FileSink::new(sink_dir(options)?, out);
-    let pace = PollPace {
-        idle: Duration::from_millis(idle),
-        active: Duration::ZERO,
-    };
-    let report = rt
-        .block_on(poll_loop(
-            &mailbox,
-            &mut sink,
-            pace,
-            async {
-                let _ = tokio::signal::ctrl_c().await;
-            },
-            |pass| {
-                if pass.claimed > 0 {
-                    eprintln!("claimed {} settled {}", pass.claimed, pass.settled);
+    let credentials = credentials(options)?;
+    let roots = extra_roots(options)?;
+    let mut spool = Spool::open(&PathBuf::from(options.require("spool")?))
+        .map_err(|error| format!("spool: {error}"))?;
+    if options.flag("follow") {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        std::thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            let _ = std::io::stdin().read(&mut byte);
+            let _ = stop_tx.send(true);
+        });
+        match rt.block_on(receive_loop(&credentials, &roots, &mut spool, stop_rx)) {
+            LoopExit::Stopped => {
+                writeln!(out, "{{\"stopped\":true}}").map_err(|error| error.to_string())
+            }
+            LoopExit::Failed(error) => Err(station_error(error)),
+        }
+    } else {
+        let mut client = rt
+            .block_on(MailboxClient::connect(&credentials, &roots))
+            .map_err(station_error)?;
+        let mut delivered = 0_u64;
+        loop {
+            match rt.block_on(client.next()) {
+                Ok(Event::Deliver {
+                    sequence,
+                    handle,
+                    packet,
+                }) => {
+                    if spool.accept(sequence, handle, &packet) != Verdict::Done {
+                        return Err("spool refused a delivery".to_owned());
+                    }
+                    rt.block_on(client.ack(sequence)).map_err(station_error)?;
+                    delivered += 1;
                 }
-            },
-        ))
-        .map_err(station_error)?;
-    writeln!(
-        out,
-        "{{\"passes\":{},\"claimed\":{}}}",
-        report.passes, report.claimed
-    )
-    .map_err(|error| error.to_string())
+                Ok(Event::Drained) => break,
+                Err(error) => return Err(station_error(error)),
+            }
+        }
+        writeln!(out, "{{\"delivered\":{delivered}}}").map_err(|error| error.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +419,13 @@ fn initiator_drive(options: &Options) -> Result<InitiatorDrive<RustCryptoProvide
 fn init(options: &Options, out: &mut impl Write) -> Result<(), String> {
     let dir = dir_path(options)?;
     std::fs::create_dir_all(&dir).map_err(|error| format!("--dir: {error}"))?;
+    #[cfg(unix)]
+    {
+        // Owner-only, like the credentials and spool directories.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("--dir: {error}"))?;
+    }
     let mut custody = custody(&dir)?;
     let identity = match LocalIdentity::load(&dir) {
         Ok(identity) => identity,
@@ -740,10 +615,11 @@ impl licoarc::state::ApplicationEffects for NoEffects {
 /// written by `begin`/`accept` stay pending until this (or an embedded
 /// dispatch) settles them — the ledger, not the transport, owns the retry.
 fn flush_pending(
-    client: Arc<StationClient>,
     options: &Options,
+    rt: &tokio::runtime::Runtime,
     out: &mut impl Write,
 ) -> Result<(), String> {
+    let client = connect(options, rt)?;
     let handle = handle(options)?;
     let mut carrier = PacketCarrierAdapter::new(
         SubmitCarrier::new(client, handle).map_err(|failure| format!("transport: {failure}"))?,
@@ -797,22 +673,60 @@ fn flush_pending(
     .map_err(|error| error.to_string())
 }
 
+/// The responder's first send needs a fresh staged X25519 for the DH
+/// ratchet step — `send_record` reports `InvalidTransition` without it, so
+/// stage through the drive's custody (the same `Rc`-shared index the
+/// endpoint resolves) and retry once.
+fn send_record_maybe_bootstrap<R, C, S>(
+    endpoint: &mut licoarc::endpoint::Endpoint<R, RustCryptoProvider, C, S>,
+    mut custody: FileCustody<RustCryptoProvider>,
+    plaintext: &[u8],
+) -> Result<licoarc::state::PendingId, String>
+where
+    R: licoarc::endpoint::Role,
+    C: licoarc::state::KeyCustody,
+    S: licoarc::state::AtomicState<licoarc::endpoint::EndpointState>,
+{
+    match endpoint.send_record(plaintext, None) {
+        Err(error) if error.code == crate::ErrorCode::InvalidTransition => {
+            let staged = custody
+                .stage(crate::ports::CustodyPurpose::X25519Private)
+                .map_err(|refusal| format!("custody: {refusal}"))?;
+            endpoint
+                .send_record(
+                    plaintext,
+                    Some(licoarc::state::StagedSecretHandle::<
+                        licoarc::state::X25519Private,
+                    >::from_custody_token(
+                        staged.custody_token()
+                    )),
+                )
+                .map_err(|error| format!("send: {error:?}"))
+        }
+        other => other.map_err(|error| format!("send: {error:?}")),
+    }
+}
+
 /// Sends one plaintext as a protected record to the session handle.
 fn record_send(
-    client: Arc<StationClient>,
     options: &Options,
+    rt: &tokio::runtime::Runtime,
     out: &mut impl Write,
 ) -> Result<(), String> {
     let plaintext = read_packet(options)?;
+    let client = connect(options, rt)?;
     let handle = handle(options)?;
     match options.require("role")?.as_str() {
         "responder" => {
             let mut drive = responder_drive(options)?;
-            let pending = drive
-                .endpoint()
-                .map_err(|refusal| format!("endpoint: {refusal}"))?
-                .send_record(&plaintext, None)
-                .map_err(|error| format!("send: {error:?}"))?;
+            let custody = drive.custody_mut().clone();
+            let pending = send_record_maybe_bootstrap(
+                drive
+                    .endpoint()
+                    .map_err(|refusal| format!("endpoint: {refusal}"))?,
+                custody,
+                &plaintext,
+            )?;
             drive
                 .persist()
                 .map_err(|refusal| format!("persist: {refusal}"))?;
@@ -831,11 +745,14 @@ fn record_send(
         }
         "initiator" => {
             let mut drive = initiator_drive(options)?;
-            let pending = drive
-                .endpoint()
-                .map_err(|refusal| format!("endpoint: {refusal}"))?
-                .send_record(&plaintext, None)
-                .map_err(|error| format!("send: {error:?}"))?;
+            let custody = drive.custody_mut().clone();
+            let pending = send_record_maybe_bootstrap(
+                drive
+                    .endpoint()
+                    .map_err(|refusal| format!("endpoint: {refusal}"))?,
+                custody,
+                &plaintext,
+            )?;
             drive
                 .persist()
                 .map_err(|refusal| format!("persist: {refusal}"))?;
@@ -857,80 +774,105 @@ fn record_send(
     writeln!(out, "{{\"submitted\":true}}").map_err(|error| error.to_string())
 }
 
-/// One pump against one live endpoint; the plaintext receiver borrows the
-/// command's writer for the sink's lifetime.
-fn pump_endpoint<R, C, S>(
+/// Reads one handle's spool files through the resumed endpoint — the local
+/// half of `receive`, with no Station traffic of its own. Committed packets
+/// are deleted, permanently refused ones move to `refused/`.
+fn record_read(options: &Options, out: &mut impl Write) -> Result<(), String> {
+    let spool = Spool::open(&PathBuf::from(options.require("spool")?))
+        .map_err(|error| format!("spool: {error}"))?;
+    let handle = handle(options)?;
+    let stored = spool
+        .stored(handle)
+        .map_err(|error| format!("spool: {error}"))?;
+    let sink_dir = match options.require("out")?.as_str() {
+        "-" => None,
+        path => Some(PathBuf::from(path)),
+    };
+    match options.require("role")?.as_str() {
+        "responder" => {
+            let mut drive = responder_drive(options)?;
+            let custody = drive.custody_mut().clone();
+            let (received, refused) = read_spool(
+                drive
+                    .endpoint()
+                    .map_err(|refusal| format!("endpoint: {refusal}"))?,
+                custody,
+                &spool,
+                &stored,
+                sink_dir,
+                out,
+            )?;
+            drive
+                .persist()
+                .map_err(|refusal| format!("persist: {refusal}"))?;
+            report(out, received, refused)
+        }
+        "initiator" => {
+            let mut drive = initiator_drive(options)?;
+            let custody = drive.custody_mut().clone();
+            let (received, refused) = read_spool(
+                drive
+                    .endpoint()
+                    .map_err(|refusal| format!("endpoint: {refusal}"))?,
+                custody,
+                &spool,
+                &stored,
+                sink_dir,
+                out,
+            )?;
+            drive
+                .persist()
+                .map_err(|refusal| format!("persist: {refusal}"))?;
+            report(out, received, refused)
+        }
+        other => Err(format!("unknown --role {other}")),
+    }
+}
+
+fn report(out: &mut impl Write, received: usize, refused: usize) -> Result<(), String> {
+    writeln!(out, "{{\"received\":{received},\"refused\":{refused}}}")
+        .map_err(|error| error.to_string())
+}
+
+fn read_spool<R, C, S>(
     endpoint: &mut licoarc::endpoint::Endpoint<R, RustCryptoProvider, C, S>,
-    mailbox: &Mailbox<HandleCarrier>,
-    rt: &tokio::runtime::Runtime,
+    mut custody: FileCustody<RustCryptoProvider>,
+    spool: &Spool,
+    stored: &[(u64, PathBuf)],
     sink_dir: Option<PathBuf>,
     out: &mut dyn Write,
-) -> Result<(usize, usize, usize), String>
+) -> Result<(usize, usize), String>
 where
     R: licoarc::endpoint::Role,
     C: licoarc::state::KeyCustody,
     S: licoarc::state::AtomicState<licoarc::endpoint::EndpointState>,
 {
-    let mut sink = EndpointSink::new(endpoint, PlaintextSink { dir: sink_dir, out });
-    let report = rt
-        .block_on(mailbox.pump(&mut sink))
-        .map_err(station_error)?;
-    Ok((report.claimed, sink.received().len(), sink.refused().len()))
-}
-
-/// Claims the session handle, verifies and commits each record through the
-/// resumed endpoint, and releases plaintexts to `--out`.
-fn record_poll(
-    client: Arc<StationClient>,
-    options: &Options,
-    rt: &tokio::runtime::Runtime,
-    out: &mut impl Write,
-) -> Result<(), String> {
-    let handle = handle(options)?;
-    let max_items = options.optional("max").map_or(Ok(16_u64), |text| {
-        text.parse::<u64>().map_err(|_| "invalid --max".to_owned())
-    })?;
-    let mailbox = Mailbox::new(HandleCarrier::new(client, handle), max_items);
-    let sink_dir = sink_dir(options)?;
-    let (claimed, received, refused) = match options.require("role")?.as_str() {
-        "responder" => {
-            let mut drive = responder_drive(options)?;
-            let result = pump_endpoint(
-                drive
-                    .endpoint()
-                    .map_err(|refusal| format!("endpoint: {refusal}"))?,
-                &mailbox,
-                rt,
-                sink_dir,
-                out,
-            )?;
-            drive
-                .persist()
-                .map_err(|refusal| format!("persist: {refusal}"))?;
-            result
-        }
-        "initiator" => {
-            let mut drive = initiator_drive(options)?;
-            let result = pump_endpoint(
-                drive
-                    .endpoint()
-                    .map_err(|refusal| format!("endpoint: {refusal}"))?,
-                &mailbox,
-                rt,
-                sink_dir,
-                out,
-            )?;
-            drive
-                .persist()
-                .map_err(|refusal| format!("persist: {refusal}"))?;
-            result
-        }
-        other => return Err(format!("unknown --role {other}")),
+    // A peer's first send rotates the DH ratchet — every record may need a
+    // fresh staged X25519 from the endpoint's own custody (shared handle).
+    let fresh = move || {
+        custody
+            .stage(crate::ports::CustodyPurpose::X25519Private)
+            .ok()
+            .map(|handle| {
+                licoarc::state::StagedSecretHandle::<licoarc::state::X25519Private>::from_custody_token(
+                    handle.custody_token(),
+                )
+            })
     };
-    writeln!(
-        out,
-        "{{\"claimed\":{},\"received\":{},\"refused\":{}}}",
-        claimed, received, refused
-    )
-    .map_err(|error| error.to_string())
+    let mut sink = EndpointSink::with_fresh(endpoint, PlaintextSink { dir: sink_dir, out }, fresh);
+    let mut marks = Vec::with_capacity(stored.len());
+    for (seq, path) in stored {
+        let packet = std::fs::read(path).map_err(|error| format!("{path:?}: {error}"))?;
+        let refused_before = sink.refused().len();
+        // `EndpointSink::accept` ignores the handle; a fixed placeholder
+        // token keeps the call well-formed without drawing entropy.
+        sink.accept(*seq, HandleToken::from_bytes([0_u8; 32]), &packet);
+        marks.push(sink.refused().len() > refused_before);
+    }
+    for ((_, path), refused_file) in stored.iter().zip(marks.iter()) {
+        spool
+            .resolve(path, *refused_file)
+            .map_err(|error| format!("spool: {error}"))?;
+    }
+    Ok((sink.received().len(), sink.refused().len()))
 }

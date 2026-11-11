@@ -1,7 +1,6 @@
-//! Session and interaction policy stubs.
+//! Session and interaction policy types.
 //!
-//! Closed enums only. Transition tables and native presence workflows belong
-//! to a later node.
+//! Closed enums only.
 
 /// Legal client session states. App lock defaults off; an unlocked device
 /// session supports ordinary operations.
@@ -12,7 +11,8 @@ pub enum ClientSessionState {
     Terminated,
 }
 
-/// Runtime-facing client session. No host or Flutter field can override state.
+/// Runtime-facing client session. No caller-supplied field can override its
+/// state; the constructors below are the only way to set it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientSession {
     state: ClientSessionState,

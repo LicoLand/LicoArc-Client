@@ -552,11 +552,15 @@ mod tests {
     }
 
     /// The authority bundle is an explicit caller artifact; the full pairing
-    /// test is gated on it exactly like the SDK's own admission tests.
-    fn authority_line() -> Option<VerifiedProtocolLine> {
-        let path = std::env::var_os("LICOARC_AUTHORITY_BUNDLE")?;
-        let bytes = std::fs::read(path).ok()?;
-        AuthorityInput::new(&bytes).admit().ok()
+    /// tests are `#[ignore]`d on it exactly like the SDK's own admission
+    /// tests — `verify.sh` runs them when the variable names a bundle.
+    fn authority_line() -> VerifiedProtocolLine {
+        let path = std::env::var_os("LICOARC_AUTHORITY_BUNDLE")
+            .expect("LICOARC_AUTHORITY_BUNDLE must name the pinned authority bundle");
+        let bytes = std::fs::read(path).expect("authority bundle readable");
+        AuthorityInput::new(&bytes)
+            .admit()
+            .expect("authority bundle admits")
     }
 
     /// A carrier that captures each packet it would send.
@@ -587,11 +591,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs LICOARC_AUTHORITY_BUNDLE"]
     fn pairing_roundtrip_establishes_a_session_and_moves_one_record() {
-        let Some(line) = authority_line() else {
-            eprintln!("LICOARC_AUTHORITY_BUNDLE unset: skipping pairing test");
-            return;
-        };
+        let line = authority_line();
         let consumer = EndpointConsumer::new();
         let clock = SystemClock;
         let responder_authority = [81; 32];
@@ -708,11 +710,9 @@ mod tests {
     /// admitted prekey survives, an awaiting initiator resumes, and an
     /// established session keeps serving records after the boundary.
     #[test]
+    #[ignore = "needs LICOARC_AUTHORITY_BUNDLE"]
     fn a_reopened_drive_resumes_from_the_last_checkpoint() {
-        let Some(line) = authority_line() else {
-            eprintln!("LICOARC_AUTHORITY_BUNDLE unset: skipping pairing test");
-            return;
-        };
+        let line = authority_line();
         let consumer = EndpointConsumer::new();
         let clock = SystemClock;
         let responder_authority = [81; 32];
@@ -850,11 +850,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs LICOARC_AUTHORITY_BUNDLE"]
     fn a_malformed_submission_and_untrusted_identity_are_refused() {
-        let Some(line) = authority_line() else {
-            eprintln!("LICOARC_AUTHORITY_BUNDLE unset: skipping pairing test");
-            return;
-        };
+        let line = authority_line();
         let consumer = EndpointConsumer::new();
         let clock = SystemClock;
         let responder_dir = temp();

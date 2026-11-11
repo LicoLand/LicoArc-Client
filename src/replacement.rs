@@ -3,9 +3,8 @@
 //! This module declares the caller-owned vocabulary for replacing a device's
 //! endpoint identity. It has no dependencies, so no SDK type appears below: the
 //! signed transition, the new-device possession proof and the accepted authority
-//! are verified by the pinned LicoArc stable-core revision
-//! `244ce7186cac1690c18f091dbe02df36a0860ef4` and reach the client only through
-//! the adapter in the protocol boundary. This module fixes what the client must
+//! are verified by the pinned `licoarc` SDK and reach this vocabulary only
+//! through [`crate::replacement_admission`]. This module fixes what the client must
 //! *bind* before that adapter is allowed to admit anything, and what it must
 //! refuse when it cannot.
 //!
@@ -13,9 +12,8 @@
 //!
 //! An archive, an imported recovery package, a provider backup and a saved
 //! recovery secret are all things a person *has*. None of them is a signed
-//! transition that says this new endpoint may become the subject's endpoint
-//! (`components/endpoint-collaboration/transfer/src/activation.rs` is the
-//! transfer owner's half of the same rule). [`ReplacementPossession`] therefore
+//! transition that says this new endpoint may become the subject's endpoint.
+//! [`ReplacementPossession`] therefore
 //! carries a credential handle and nothing else, and it is not accepted as an
 //! authorization by anything in this crate.
 //!
@@ -272,7 +270,7 @@ pub trait ReplacementCredentials {
 ///
 /// Only a verifier that actually ran the SDK entry produces [`Self::Authorized`],
 /// so a caller cannot reach an authorization by holding a backup. This mirrors
-/// `licoup_protocol_bindings::TrustFacts`, whose constructors are private and
+/// [`crate::TrustFacts`], whose constructors are private and
 /// fallible for the same reason.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplacementAuthority {
