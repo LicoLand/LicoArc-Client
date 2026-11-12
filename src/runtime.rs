@@ -20,6 +20,6 @@ mod sink;
 mod spool;
 
 pub use drain::{DrainReport, PendingWork, drain_pending};
-pub use mailbox::{LoopExit, PacketSink, Verdict, receive_loop};
+pub use mailbox::{LoopExit, PacketSink, ReconnectPolicy, Verdict, receive_loop};
 pub use sink::{EndpointSink, FreshPrivate, NoFreshPrivate, Received, Refused, SessionSink};
 pub use spool::Spool;

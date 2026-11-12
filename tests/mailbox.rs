@@ -12,8 +12,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use licoarc::transport::{ClientFrame, StationFrame};
 use licoarc_client::{
-    Credentials, Event, HandleToken, LoopExit, MailboxClient, PacketSink, Spool, StationError,
-    SubmitCarrier, Verdict, receive_loop,
+    Credentials, Event, HandleToken, LoopExit, MailboxClient, PacketSink, ReconnectPolicy, Spool,
+    StationError, SubmitCarrier, Verdict, receive_loop,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -601,7 +601,14 @@ async fn receive_loop_stops_on_terminal_errors_without_reconnecting() {
         let (station, dir) = start_station(behaviour, true).await;
         let credentials = mint_credentials(&station, &dir);
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        let exit = receive_loop(&credentials, &roots(&station), &mut Never, rx).await;
+        let exit = receive_loop(
+            &credentials,
+            &roots(&station),
+            &mut Never,
+            rx,
+            ReconnectPolicy::default(),
+        )
+        .await;
         match (expect, exit) {
             ("superseded", LoopExit::Failed(StationError::Superseded)) => {}
             ("revoked", LoopExit::Failed(StationError::Revoked)) => {}
@@ -659,7 +666,16 @@ async fn a_503_upgrade_is_retried_by_receive_loop() {
     .unwrap();
     let (_tx, rx) = tokio::sync::watch::channel(false);
     let mut never = Never;
-    let probe = tokio::spawn(async move { receive_loop(&credentials, &[], &mut never, rx).await });
+    let probe = tokio::spawn(async move {
+        receive_loop(
+            &credentials,
+            &[],
+            &mut never,
+            rx,
+            ReconnectPolicy::default(),
+        )
+        .await
+    });
     // The loop retries indefinitely; several attempts should accumulate.
     tokio::time::sleep(Duration::from_millis(2_000)).await;
     assert!(
@@ -684,8 +700,16 @@ async fn stop_observed_while_connected_and_idle() {
     }
     let mut never = Never;
     let roots = roots(&station);
-    let task =
-        tokio::spawn(async move { receive_loop(&credentials, &roots, &mut never, rx).await });
+    let task = tokio::spawn(async move {
+        receive_loop(
+            &credentials,
+            &roots,
+            &mut never,
+            rx,
+            ReconnectPolicy::default(),
+        )
+        .await
+    });
     // Let the connection establish and go idle, then stop.
     tokio::time::sleep(Duration::from_millis(500)).await;
     tx.send(true).unwrap();

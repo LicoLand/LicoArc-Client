@@ -1,29 +1,35 @@
 name: Publish
 
-# Runs the default-branch copy of this file after Verify succeeds for a pushed
-# `<crate>-v<version>` tag, so a tagged commit can never supply the workflow
-# that receives the crates.io trusted-publishing identity.
+# Verify dispatches this workflow on the default branch. The release environment
+# must permit deployments only from that branch.
 on:
-  workflow_run:
-    workflows: [Verify]
-    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Verified crate-version tag
+        type: string
+      verify_run:
+        description: Verify workflow run for that tag
+        type: string
+      authenticate_only:
+        description: Exchange and revoke an OIDC token without publishing
+        type: boolean
+        default: false
 
 permissions: {}
 
 concurrency:
-  group: publish-${{ github.event.workflow_run.head_branch }}
+  group: publish-${{ inputs.tag || 'authentication' }}
   cancel-in-progress: false
 
 jobs:
   publish:
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      contains(github.event.workflow_run.head_branch, '-v')
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: read
+      actions: read
       id-token: write
     # No step in this job executes repository-controlled code: the toolchain
     # is installed before checkout and pinned for every cargo call, cargo runs
@@ -31,33 +37,58 @@ jobs:
     # configuration is never read, and nothing is compiled under the token.
     steps:
       - name: Prepare an isolated publishing toolchain
+        if: ${{ !inputs.authenticate_only }}
         run: |
           set -euo pipefail
           rustup toolchain install 1.95.0 --profile minimal
           mkdir -p "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/publish"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: ${{ !inputs.authenticate_only }}
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
       - name: Bind the tag to reviewed default-branch source
+        if: ${{ !inputs.authenticate_only }}
         id: crate
         working-directory: ${{ runner.temp }}/publish
         env:
-          TAG: ${{ github.event.workflow_run.head_branch }}
-          SHA: ${{ github.event.workflow_run.head_sha }}
+          TAG: ${{ inputs.tag }}
+          VERIFY_RUN: ${{ inputs.verify_run }}
+          GH_TOKEN: ${{ github.token }}
+          VERIFY_STATUS_POLL_SECONDS: "5"
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RUSTUP_TOOLCHAIN: 1.95.0
           CARGO_HOME: ${{ runner.temp }}/cargo-home
         run: |
           set -euo pipefail
+          [[ "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*-v[0-9] ]]
+          [[ "$VERIFY_RUN" =~ ^[1-9][0-9]*$ ]]
           case "$TAG" in
             *[!A-Za-z0-9._-]*) echo "::error::unexpected tag name"; exit 1 ;;
           esac
           repo="$GITHUB_WORKSPACE"
+          SHA="$(git -C "$repo" rev-parse HEAD)"
           git -C "$repo" fetch --no-tags origin "+refs/tags/$TAG:refs/tags/$TAG" "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
           test "$(git -C "$repo" rev-parse "refs/tags/$TAG^{commit}")" = "$SHA"
           git -C "$repo" merge-base --is-ancestor "$SHA" "refs/remotes/origin/$DEFAULT_BRANCH"
+          while true; do
+            review="$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$VERIFY_RUN")"
+            jq -e --arg sha "$SHA" --arg tag "$TAG" --arg repo "$GITHUB_REPOSITORY" '
+              .path == ".github/workflows/verify.yml" and
+              .event == "push" and .head_sha == $sha and .head_branch == $tag and
+              .repository.full_name == $repo and .head_repository.full_name == $repo
+            ' <<<"$review" >/dev/null
+            if [ "$(jq -r .status <<<"$review")" = "completed" ]; then
+              jq -e '.conclusion == "success"' <<<"$review" >/dev/null
+              break
+            fi
+            sleep "$VERIFY_STATUS_POLL_SECONDS"
+          done
           crate="${TAG%-v*}"
           version="${TAG##*-v}"
           actual="$(cargo metadata --no-deps --format-version 1 --manifest-path "$repo/Cargo.toml" | jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version')"
@@ -88,11 +119,12 @@ jobs:
             404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
             *) echo "::error::crates.io lookup for $crate $version returned $status"; exit 1 ;;
           esac
-      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
-        if: steps.crate.outputs.published == 'false'
+      - name: Authenticate with crates.io
+        if: ${{ inputs.authenticate_only || steps.crate.outputs.published == 'false' }}
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
       - name: Publish
-        if: steps.crate.outputs.published == 'false'
+        if: ${{ !inputs.authenticate_only && steps.crate.outputs.published == 'false' }}
         working-directory: ${{ runner.temp }}/publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

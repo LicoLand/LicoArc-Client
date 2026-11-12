@@ -19,7 +19,26 @@ caller-owned through [`ports`](../src/ports.rs). This crate composes them:
 - `providers` — the CLI's own backend: `FileCustody` (atomically replaced
   custody index, development-grade) and `MemoryState` (coupled old-or-new
   store; durability comes from the SDK's `checkpoint`/`resume` pair);
+- `durable_obligation` — an opt-in ledger of caller-admitted delivery
+  obligations, including its serialized recovery record;
 - `cli` — the standalone command line.
+
+## Durable obligation records
+
+LicoArc-Client owns the `ObligationLedger<Payload>` API and the
+`DurableObligationRecord<Payload>` envelope it produces. The envelope records
+admission identities, generation and delivery attempts; callers supply the
+payload type and persist the record through their own storage backend.
+Admission creates an obligation that remains owed until accepted settlement.
+
+The published record identifier, `DURABLE_OBLIGATION_SCHEMA`, is
+`licoarc.endpoint-obligations.v1`, namespaced to the crate that owns the
+format. That spelling is part of this library's serialized contract and is
+retained for existing records; it superseded the `licoup.*` spelling first
+published in 0.2.0, and records carrying the older tag are not read as this
+schema. Readers use `schema_matches` or `from_durable_record` to validate it
+before recovering the owed set. This is a client-local persistence format;
+LicoArc owns the protocol's wire definitions.
 
 ## CLI
 
@@ -27,7 +46,7 @@ caller-owned through [`ports`](../src/ports.rs). This crate composes them:
 licoarc-client enroll  --station URL --invitation-file PATH --credentials FILE [--ca PATH]
 licoarc-client handle  --credentials FILE
 licoarc-client send    --credentials FILE --handle TOKEN [--file PATH|-] [--ca PATH]
-licoarc-client receive --credentials FILE --spool DIR [--follow] [--ca PATH]
+licoarc-client receive --credentials FILE --spool DIR [--follow] [--ca PATH] [--reconnect-initial-ms N] [--reconnect-multiplier N] [--reconnect-cap-ms N]
 ```
 
 Two endpoints close the transport loop over one Station: `enroll` turns a
@@ -65,6 +84,24 @@ and clears pending output. Once the session is established,
 `record-send` submits a record and `record-read` consumes what `receive`
 spooled. All session state persists through the SDK's checkpoint/resume
 pair, so any step may run in a fresh process.
+
+## Local state
+
+Keep endpoint state, credentials, spool contents and received plaintext in a
+private directory outside Git checkouts. The CLI rejects checkout-local
+private output paths, including ignored directories, before creating state
+or opening a connection. The check inspects the supplied path and resolves
+existing ancestors to reject symlink targets inside a checkout.
+
+The boundary covers endpoint `--dir`, enrollment `--credentials`, receive
+and record-read `--spool`, and the commands' file or directory `--out`
+destinations. Read-only inputs remain caller-selected. Where a command
+supports `--out -`, the caller controls the stdout destination and must keep
+private output out of source control.
+
+The repository's ignore rules also cover the fixed endpoint-state filenames,
+`credentials.json` and invitation files. The shareable `peer-identity.json`
+is a runtime exchange artifact and should not be committed as source.
 
 ## Verify
 

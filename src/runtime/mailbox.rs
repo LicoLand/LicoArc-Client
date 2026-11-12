@@ -38,10 +38,38 @@ pub enum LoopExit {
     Failed(StationError),
 }
 
+/// How [`receive_loop`] paces reconnects after ordinary connection loss.
+///
+/// Reconnect timing is an operational parameter: callers supply the cadence
+/// their environment needs, and [`Default`] preserves the values shipped in
+/// 0.2.0 — 250 ms initial, doubling to a 60 s cap, with up to +50 % uniform
+/// jitter on top.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReconnectPolicy {
+    /// The delay before the first retry after a lost connection, and the
+    /// delay the cadence resets to after a successful connect.
+    pub initial: Duration,
+    /// The factor the delay grows by after each lost attempt. `0` and `1`
+    /// both keep it fixed at `initial`.
+    pub multiplier: u32,
+    /// The longest unjittered delay between attempts.
+    pub cap: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            initial: Duration::from_millis(250),
+            multiplier: 2,
+            cap: Duration::from_millis(60_000),
+        }
+    }
+}
+
 /// Runs one mailbox receive loop until `stop` or a terminal error.
 ///
 /// Ordinary connection loss retries forever with jittered exponential
-/// backoff capped at 60 s — the only timers the contract allows are the
+/// backoff paced by `policy` — the only timers the contract allows are the
 /// keepalive cadence and this backoff. Superseded, Revoked, DeviceMismatch,
 /// and Refused are terminal: another client owns the mailbox or access
 /// ended, and the loop must never fight for it.
@@ -50,8 +78,17 @@ pub async fn receive_loop<S: PacketSink>(
     extra_roots: &[PathBuf],
     sink: &mut S,
     mut stop: watch::Receiver<bool>,
+    policy: ReconnectPolicy,
 ) -> LoopExit {
-    let mut backoff_ms = 250_u64;
+    let cap_ms = u64::try_from(policy.cap.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let multiplier = u64::from(policy.multiplier.max(1));
+    let initial_ms = u64::try_from(policy.initial.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(cap_ms)
+        .max(1);
+    let mut backoff_ms = initial_ms;
     loop {
         if *stop.borrow() {
             return LoopExit::Stopped;
@@ -67,7 +104,7 @@ pub async fn receive_loop<S: PacketSink>(
             }
             Err(_) => {}
             Ok(mut client) => {
-                backoff_ms = 250;
+                backoff_ms = initial_ms;
                 match drive(&mut client, sink, &mut stop).await {
                     DriveOutcome::Stopped => return LoopExit::Stopped,
                     DriveOutcome::Fatal(error) => return LoopExit::Failed(error),
@@ -76,7 +113,7 @@ pub async fn receive_loop<S: PacketSink>(
             }
         }
         let wait = jittered(backoff_ms);
-        backoff_ms = (backoff_ms * 2).min(60_000);
+        backoff_ms = backoff_ms.saturating_mul(multiplier).min(cap_ms);
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             _ = stop.changed() => {
