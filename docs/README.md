@@ -19,7 +19,24 @@ caller-owned through [`ports`](../src/ports.rs). This crate composes them:
 - `providers` — the CLI's own backend: `FileCustody` (atomically replaced
   custody index, development-grade) and `MemoryState` (coupled old-or-new
   store; durability comes from the SDK's `checkpoint`/`resume` pair);
+- `durable_obligation` — an opt-in ledger of caller-admitted delivery
+  obligations, including its serialized recovery record;
 - `cli` — the standalone command line.
+
+## Durable obligation records
+
+LicoArc-Client owns the `ObligationLedger<Payload>` API and the
+`DurableObligationRecord<Payload>` envelope it produces. The envelope records
+admission identities, generation and delivery attempts; callers supply the
+payload type and persist the record through their own storage backend.
+Admission creates an obligation that remains owed until accepted settlement.
+
+The published record identifier, `DURABLE_OBLIGATION_SCHEMA`, is
+`licoup.endpoint-obligations.v1`. That spelling is part of this library's
+serialized contract and is retained for existing records. Readers use
+`schema_matches` or `from_durable_record` to validate it before recovering
+the owed set. This is a client-local persistence format; LicoArc owns the
+protocol's wire definitions.
 
 ## CLI
 
