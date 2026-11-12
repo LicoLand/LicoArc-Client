@@ -32,11 +32,13 @@ payload type and persist the record through their own storage backend.
 Admission creates an obligation that remains owed until accepted settlement.
 
 The published record identifier, `DURABLE_OBLIGATION_SCHEMA`, is
-`licoup.endpoint-obligations.v1`. That spelling is part of this library's
-serialized contract and is retained for existing records. Readers use
-`schema_matches` or `from_durable_record` to validate it before recovering
-the owed set. This is a client-local persistence format; LicoArc owns the
-protocol's wire definitions.
+`licoarc.endpoint-obligations.v1`, namespaced to the crate that owns the
+format. That spelling is part of this library's serialized contract and is
+retained for existing records; it superseded the `licoup.*` spelling first
+published in 0.2.0, and records carrying the older tag are not read as this
+schema. Readers use `schema_matches` or `from_durable_record` to validate it
+before recovering the owed set. This is a client-local persistence format;
+LicoArc owns the protocol's wire definitions.
 
 ## CLI
 

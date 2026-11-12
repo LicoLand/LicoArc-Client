@@ -192,7 +192,7 @@ pub struct DurableObligationRecord<Payload> {
 }
 
 /// The schema of [`DurableObligationRecord`].
-pub const DURABLE_OBLIGATION_SCHEMA: &str = "licoup.endpoint-obligations.v1";
+pub const DURABLE_OBLIGATION_SCHEMA: &str = "licoarc.endpoint-obligations.v1";
 
 impl<Payload: Clone> DurableObligationRecord<Payload> {
     /// The generation this record was written at.
@@ -639,7 +639,7 @@ mod tests {
         let mut record = ledger.durable_record();
         assert!(record.schema_matches());
         let foreign = DurableObligationRecord {
-            schema: "licoup.endpoint-obligations.v0".to_owned(),
+            schema: "licoarc.endpoint-obligations.v0".to_owned(),
             ..record.clone()
         };
         assert!(ObligationLedger::from_durable_record(foreign).is_none());
