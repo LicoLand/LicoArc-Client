@@ -20,7 +20,7 @@
 //! returns over the initiator's handle, and one session record travels each
 //! way.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use licoarc::provider::RustCryptoProvider;
 use licoarc::state::{ApplicationEffects, PlaintextReceiver};
@@ -50,13 +50,17 @@ fn env_config() -> Option<Config> {
 
 /// Enrolls one endpoint: fresh credentials from its invitation file, a
 /// handshake that binds the mailbox id, and a live mailbox client.
-async fn enroll(config: &Config, invitation: &str) -> MailboxClient {
+async fn enroll(config: &Config, invitation: &str, directory: &Path) -> MailboxClient {
     let token = std::fs::read_to_string(config.invitations.join(invitation))
         .expect("invitation file readable")
         .trim()
         .to_owned();
-    let credentials = Credentials::mint(config.origin.clone(), token, PathBuf::from("/dev/null"))
-        .expect("credentials mint");
+    let credentials = Credentials::mint(
+        config.origin.clone(),
+        token,
+        directory.join("credentials.json"),
+    )
+    .expect("credentials mint");
     let roots = vec![config.ca.clone()];
     MailboxClient::connect(&credentials, &roots)
         .await
@@ -164,8 +168,16 @@ fn pairing_over_a_real_station_moves_a_record() {
 
     let responder_dir = temp();
     let initiator_dir = temp();
-    let mut responder_client = runtime.block_on(enroll(&config, "responder.invitation"));
-    let mut initiator_client = runtime.block_on(enroll(&config, "initiator.invitation"));
+    let mut responder_client = runtime.block_on(enroll(
+        &config,
+        "responder.invitation",
+        responder_dir.path(),
+    ));
+    let mut initiator_client = runtime.block_on(enroll(
+        &config,
+        "initiator.invitation",
+        initiator_dir.path(),
+    ));
     let responder_handle = HandleToken::mint(responder_client.mailbox_id()).expect("mint");
     let initiator_handle = HandleToken::mint(initiator_client.mailbox_id()).expect("mint");
 
