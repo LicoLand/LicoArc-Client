@@ -46,7 +46,7 @@ LicoArc owns the protocol's wire definitions.
 licoarc-client enroll  --station URL --invitation-file PATH --credentials FILE [--ca PATH]
 licoarc-client handle  --credentials FILE
 licoarc-client send    --credentials FILE --handle TOKEN [--file PATH|-] [--ca PATH]
-licoarc-client receive --credentials FILE --spool DIR [--follow] [--ca PATH]
+licoarc-client receive --credentials FILE --spool DIR [--follow] [--ca PATH] [--reconnect-initial-ms N] [--reconnect-multiplier N] [--reconnect-cap-ms N]
 ```
 
 Two endpoints close the transport loop over one Station: `enroll` turns a

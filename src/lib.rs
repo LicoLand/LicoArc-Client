@@ -81,7 +81,7 @@ pub use replacement_admission::{
 };
 pub use runtime::{
     DrainReport, EndpointSink, FreshPrivate, LoopExit, NoFreshPrivate, PacketSink, PendingWork,
-    Received, Refused, SessionSink, Spool, Verdict, drain_pending, receive_loop,
+    Received, ReconnectPolicy, Refused, SessionSink, Spool, Verdict, drain_pending, receive_loop,
 };
 pub use session::{
     EnvelopeRefusal, FileState, InitiatorDrive, LocalIdentity, MintRefusal, OfferRefusal,

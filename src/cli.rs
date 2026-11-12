@@ -9,7 +9,7 @@
 //! licoarc-client enroll --station URL --invitation-file PATH --credentials FILE [--ca PATH]
 //! licoarc-client handle --credentials FILE
 //! licoarc-client send --credentials FILE --handle TOKEN [--file PATH|-] [--ca PATH]
-//! licoarc-client receive --credentials FILE --spool DIR [--follow] [--ca PATH]
+//! licoarc-client receive --credentials FILE --spool DIR [--follow] [--ca PATH] [--reconnect-initial-ms N] [--reconnect-multiplier N] [--reconnect-cap-ms N]
 //! licoarc-client init --dir DIR --authority BUNDLE
 //! licoarc-client offer --dir DIR --authority BUNDLE --handle TOKEN --sequence N [--from T] [--until T] --authority-digest HEX64 [--out FILE|-]
 //! licoarc-client begin --dir DIR --authority BUNDLE --offer FILE|- --reply-handle TOKEN --authority-digest HEX64 [--out FILE|-]
@@ -35,6 +35,7 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::adapters::PacketCarrierAdapter;
 use crate::carrier::{Credentials, Event, HandleToken, MailboxClient, StationError, SubmitCarrier};
@@ -42,7 +43,8 @@ use crate::inbound::EndpointConsumer;
 use crate::ports::Clock;
 use crate::providers::FileCustody;
 use crate::runtime::{
-    EndpointSink, LoopExit, PacketSink, Spool, Verdict, drain_pending, receive_loop,
+    EndpointSink, LoopExit, PacketSink, ReconnectPolicy, Spool, Verdict, drain_pending,
+    receive_loop,
 };
 use crate::session::{
     InitiatorDrive, LocalIdentity, PairingOffer, ResponderDrive, StaticTrust, SystemClock,
@@ -107,7 +109,7 @@ pub fn run(arguments: &[String], out: &mut impl Write, err: &mut impl Write) -> 
 
 fn usage(err: &mut impl Write) -> Exit {
     let _ = err.write_all(
-        b"usage:\n  licoarc-client enroll --station URL --invitation-file PATH --credentials FILE [--ca PATH]\n  licoarc-client handle --credentials FILE\n  licoarc-client send --credentials FILE --handle TOKEN [--file PATH|-] [--ca PATH]\n  licoarc-client receive --credentials FILE --spool DIR [--follow] [--ca PATH]\n  licoarc-client init --dir DIR --authority BUNDLE\n  licoarc-client offer --dir DIR --authority BUNDLE --handle TOKEN --sequence N [--from T] [--until T] --authority-digest HEX64 [--out FILE|-]\n  licoarc-client begin --dir DIR --authority BUNDLE --offer FILE|- --reply-handle TOKEN --authority-digest HEX64 [--out FILE|-]\n  licoarc-client accept --dir DIR --authority BUNDLE --peer FILE --authority-digest HEX64 --session-handle TOKEN [--in FILE|-] [--out FILE|-]\n  licoarc-client finish --dir DIR --authority BUNDLE [--in FILE|-]\n  licoarc-client dispatch --dir DIR --role responder|initiator --authority BUNDLE --credentials FILE --handle TOKEN [--out DIR] [--ca PATH]\n  licoarc-client record-send --dir DIR --role responder|initiator --authority BUNDLE --credentials FILE --handle TOKEN [--file PATH|-] [--ca PATH]\n  licoarc-client record-read --dir DIR --role responder|initiator --authority BUNDLE --spool DIR --handle TOKEN --out DIR\n",
+        b"usage:\n  licoarc-client enroll --station URL --invitation-file PATH --credentials FILE [--ca PATH]\n  licoarc-client handle --credentials FILE\n  licoarc-client send --credentials FILE --handle TOKEN [--file PATH|-] [--ca PATH]\n  licoarc-client receive --credentials FILE --spool DIR [--follow] [--ca PATH] [--reconnect-initial-ms N] [--reconnect-multiplier N] [--reconnect-cap-ms N]\n  licoarc-client init --dir DIR --authority BUNDLE\n  licoarc-client offer --dir DIR --authority BUNDLE --handle TOKEN --sequence N [--from T] [--until T] --authority-digest HEX64 [--out FILE|-]\n  licoarc-client begin --dir DIR --authority BUNDLE --offer FILE|- --reply-handle TOKEN --authority-digest HEX64 [--out FILE|-]\n  licoarc-client accept --dir DIR --authority BUNDLE --peer FILE --authority-digest HEX64 --session-handle TOKEN [--in FILE|-] [--out FILE|-]\n  licoarc-client finish --dir DIR --authority BUNDLE [--in FILE|-]\n  licoarc-client dispatch --dir DIR --role responder|initiator --authority BUNDLE --credentials FILE --handle TOKEN [--out DIR] [--ca PATH]\n  licoarc-client record-send --dir DIR --role responder|initiator --authority BUNDLE --credentials FILE --handle TOKEN [--file PATH|-] [--ca PATH]\n  licoarc-client record-read --dir DIR --role responder|initiator --authority BUNDLE --spool DIR --handle TOKEN --out DIR\n",
     );
     Exit::USAGE
 }
@@ -156,6 +158,34 @@ impl Options {
     fn flag(&self, name: &str) -> bool {
         self.flags.contains(name)
     }
+}
+
+/// The operator's reconnect cadence for `receive --follow`: optional
+/// `--reconnect-initial-ms`, `--reconnect-multiplier` and
+/// `--reconnect-cap-ms` values layered over the library defaults.
+fn reconnect_policy(options: &Options) -> Result<ReconnectPolicy, String> {
+    let mut policy = ReconnectPolicy::default();
+    for (name, slot) in [
+        ("reconnect-initial-ms", &mut policy.initial),
+        ("reconnect-cap-ms", &mut policy.cap),
+    ] {
+        if let Some(value) = options.optional(name) {
+            let millis: u64 = value
+                .parse()
+                .ok()
+                .filter(|millis| *millis > 0)
+                .ok_or_else(|| format!("--{name} must be a positive integer of milliseconds"))?;
+            *slot = Duration::from_millis(millis);
+        }
+    }
+    if let Some(value) = options.optional("reconnect-multiplier") {
+        policy.multiplier = value
+            .parse::<u32>()
+            .ok()
+            .filter(|multiplier| *multiplier >= 1)
+            .ok_or_else(|| "--reconnect-multiplier must be an integer ≥ 1".to_owned())?;
+    }
+    Ok(policy)
 }
 
 fn credentials_path(options: &Options) -> Result<PathBuf, String> {
@@ -323,7 +353,13 @@ fn receive(
             let _ = std::io::stdin().read(&mut byte);
             let _ = stop_tx.send(true);
         });
-        match rt.block_on(receive_loop(&credentials, &roots, &mut spool, stop_rx)) {
+        match rt.block_on(receive_loop(
+            &credentials,
+            &roots,
+            &mut spool,
+            stop_rx,
+            reconnect_policy(options)?,
+        )) {
             LoopExit::Stopped => {
                 writeln!(out, "{{\"stopped\":true}}").map_err(|error| error.to_string())
             }
