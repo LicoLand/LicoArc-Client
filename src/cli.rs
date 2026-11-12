@@ -50,6 +50,8 @@ use crate::session::{
 };
 use crate::{AuthorityInput, Error};
 
+mod private_output;
+
 /// The process exit code the caller sees.
 pub struct Exit(pub i32);
 
@@ -75,6 +77,10 @@ pub fn run(arguments: &[String], out: &mut impl Write, err: &mut impl Write) -> 
     };
     if options.flag("help") {
         return usage(err);
+    }
+    if let Err(message) = private_output::validate(command, &options) {
+        let _ = writeln!(err, "licoarc-client: {message}");
+        return Exit::FAILURE;
     }
     // Multi-thread so the spawned mailbox io_loop keeps advancing while the
     // protocol thread blocks inside SubmitCarrier's private runtime.

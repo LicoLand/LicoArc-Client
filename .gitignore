@@ -18,3 +18,14 @@ tmp/
 # Local dev artifacts (authority bundle, devnet state)
 dev/
 .cargo/
+
+# Generated endpoint state and common secret input files, wherever created.
+custody.index
+identity.json
+peer-identity.json
+endpoint.checkpoint
+endpoint.integrity
+endpoint.generation
+endpoint.scope
+credentials.json
+*.invitation

@@ -9,7 +9,7 @@
 //!
 //! - `LICOARC_AUTHORITY_BUNDLE` — one authority bundle artifact;
 //! - `LICOARC_DEVNET_STATION` — the Station origin, e.g.
-//!   `https://localhost:8443`;
+//!   `wss://station.example.invalid`;
 //! - `LICOARC_DEVNET_CA` — PEM file added to the trust roots for the
 //!   development certificate;
 //! - `LICOARC_DEVNET_INVITATIONS` — directory containing

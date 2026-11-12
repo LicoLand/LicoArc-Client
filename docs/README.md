@@ -83,6 +83,24 @@ and clears pending output. Once the session is established,
 spooled. All session state persists through the SDK's checkpoint/resume
 pair, so any step may run in a fresh process.
 
+## Local state
+
+Keep endpoint state, credentials, spool contents and received plaintext in a
+private directory outside Git checkouts. The CLI rejects checkout-local
+private output paths, including ignored directories, before creating state
+or opening a connection. The check inspects the supplied path and resolves
+existing ancestors to reject symlink targets inside a checkout.
+
+The boundary covers endpoint `--dir`, enrollment `--credentials`, receive
+and record-read `--spool`, and the commands' file or directory `--out`
+destinations. Read-only inputs remain caller-selected. Where a command
+supports `--out -`, the caller controls the stdout destination and must keep
+private output out of source control.
+
+The repository's ignore rules also cover the fixed endpoint-state filenames,
+`credentials.json` and invitation files. The shareable `peer-identity.json`
+is a runtime exchange artifact and should not be committed as source.
+
 ## Verify
 
 ```sh
