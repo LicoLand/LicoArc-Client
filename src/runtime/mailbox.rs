@@ -211,7 +211,10 @@ fn jittered(base_ms: u64) -> Duration {
     let mut extra = [0_u8; 8];
     getrandom::fill(&mut extra).unwrap_or_default();
     let jitter = u64::from_be_bytes(extra) % (base_ms / 2 + 1);
-    Duration::from_millis(base_ms + jitter)
+    // The CLI accepts the full positive u64 range, so the addition must not
+    // overflow: base and jitter are added as Durations, which can always hold
+    // their sum (two u64 millisecond counts stay far below Duration::MAX).
+    Duration::from_millis(base_ms) + Duration::from_millis(jitter)
 }
 
 #[cfg(test)]
@@ -258,6 +261,19 @@ mod tests {
             let wait = jittered(200);
             assert!(wait >= Duration::from_millis(200));
             assert!(wait <= Duration::from_millis(300));
+        }
+    }
+
+    /// The CLI accepts the full positive u64 millisecond range. At the
+    /// accepted upper bound the jittered wait is still selected correctly:
+    /// it stays in `[base, base + base/2]` and never panics or wraps short.
+    #[test]
+    fn jitter_at_the_largest_accepted_base_never_overflows() {
+        let base = Duration::from_millis(u64::MAX);
+        for _ in 0..64 {
+            let wait = jittered(u64::MAX);
+            assert!(wait >= base);
+            assert!(wait <= base + Duration::from_millis(u64::MAX / 2));
         }
     }
 }

@@ -529,7 +529,7 @@ mod tests {
         self, AcceptedUserAuthority, authority_signature_input, replacement_possession_input,
         validate_user_authority_state,
     };
-    use licoarc::provider::{Provider, RustCryptoProvider};
+    use licoarc::provider::{DigestProvider, Provider, RustCryptoProvider};
     use serde_json::{Value, json};
 
     use super::{
@@ -537,6 +537,12 @@ mod tests {
         ReplacementPredecessor, ReplacementSession, SdkReplacementAuthority,
     };
     use crate::version::ACCEPTED_PROTOCOL_LINE_ID;
+    use crate::{
+        AuthoritySource, ColdReplacementRequest, ReplacementAuthorityRefusal, ReplacementBinding,
+        ReplacementOperation, ReplacementRequest, admit_replacement_catch_up,
+        admit_replacement_cold, admit_replacement_cold_with_authority,
+        admit_replacement_with_authority,
+    };
 
     const ED25519_PROFILE: &str =
         "176b912b9547ca9c47ace10f881457ab63fcd493ef953616f5859e76b830fd60";
@@ -711,7 +717,10 @@ mod tests {
     /// One genesis record, its accepted authority, and the devices it names.
     ///
     /// The record's `protocolLineId` is this build's own pinned line id, because
-    /// the SDK refuses any other (`src/identity.rs`).
+    /// the SDK refuses any other (`src/identity.rs`). The roster holds two
+    /// active devices: the one every session presents, and a second one that
+    /// stays active across transitions so an "already-active destination"
+    /// claim is expressible.
     struct Fixture {
         genesis: Value,
         accepted: AcceptedUserAuthority,
@@ -719,15 +728,71 @@ mod tests {
         keys: Vec<ReplacementEndpointKeys>,
         endpoint_identity_ref: [u8; 32],
         identity_state_digest: [u8; 32],
+        second_endpoint_identity_ref: [u8; 32],
+        second_identity_state_digest: [u8; 32],
+    }
+
+    /// One roster entry with a placeholder possession proof, as the SDK's own
+    /// recipe builds it (`src/conformance/executor.rs`).
+    fn device_entry(
+        endpoint_identity_ref: &[u8; 32],
+        identity_state_digest: &[u8; 32],
+        device: &Pair,
+        admitted: u64,
+    ) -> Value {
+        json!({
+            "endpointIdentityRef": hex(endpoint_identity_ref),
+            "identityStateDigest": hex(identity_state_digest),
+            "deviceStatus": "active",
+            "admittedAuthorityEpoch": admitted,
+            "possessionProof": placeholder_signatures(device, "device-possession"),
+        })
+    }
+
+    /// The SDK requires `authorizedDevices` sorted by `endpointIdentityRef`
+    /// (`src/identity.rs`).
+    fn sort_devices(state: &mut Value) {
+        if let Some(devices) = state["authorizedDevices"].as_array_mut() {
+            devices.sort_by_cached_key(|entry| {
+                super::decode_hex(entry["endpointIdentityRef"].as_str().unwrap_or_default())
+                    .unwrap_or_default()
+            });
+        }
+    }
+
+    fn device_index(state: &Value, endpoint_identity_ref: &str) -> usize {
+        state["authorizedDevices"]
+            .as_array()
+            .expect("roster")
+            .iter()
+            .position(|entry| entry["endpointIdentityRef"] == json!(endpoint_identity_ref))
+            .expect("the device is in the roster")
+    }
+
+    fn sign_device_possession(
+        provider: &impl Provider,
+        state: &mut Value,
+        device: &Pair,
+        index: usize,
+    ) {
+        let input = identity::device_possession_input(state, &state["authorizedDevices"][index])
+            .expect("device possession input");
+        state["authorizedDevices"][index]["possessionProof"] =
+            Value::Array(signatures(provider, device, &input, "device-possession"));
     }
 
     fn fixture(provider: &impl Provider) -> Fixture {
         let management = pair(provider, "management", 10);
         let recovery = pair(provider, "recovery", 20);
         let device = pair(provider, "management", 40);
+        let second_device = pair(provider, "management", 50);
         let line_id = ACCEPTED_PROTOCOL_LINE_ID;
         let endpoint_identity_ref = provider.sha256(b"synthetic-replacement:endpoint");
         let identity_state_digest = provider.sha256(b"synthetic-replacement:endpoint-state");
+        let second_endpoint_identity_ref =
+            provider.sha256(b"synthetic-replacement:endpoint-second");
+        let second_identity_state_digest =
+            provider.sha256(b"synthetic-replacement:endpoint-state-second");
         let user_identity_ref =
             identity::derive_user_identity_ref(provider, &management.keys, &recovery.keys)
                 .expect("user identity ref");
@@ -739,24 +804,32 @@ mod tests {
             "authorityTransitionKind": "genesis",
             "managementSigningKeys": management.keys.clone(),
             "recoverySigningKeys": recovery.keys.clone(),
-            "authorizedDevices": [{
-                "endpointIdentityRef": hex(&endpoint_identity_ref),
-                "identityStateDigest": hex(&identity_state_digest),
-                "deviceStatus": "active",
-                "admittedAuthorityEpoch": 0,
-                "possessionProof": placeholder_signatures(&device, "device-possession")
-            }],
+            "authorizedDevices": [
+                device_entry(&endpoint_identity_ref, &identity_state_digest, &device, 0),
+                device_entry(
+                    &second_endpoint_identity_ref,
+                    &second_identity_state_digest,
+                    &second_device,
+                    0,
+                ),
+            ],
             "authoritySignatures": placeholder_signatures(&management, "authority-genesis")
         });
-        let possession_input =
-            identity::device_possession_input(&genesis, &genesis["authorizedDevices"][0])
-                .expect("device possession input");
-        genesis["authorizedDevices"][0]["possessionProof"] = Value::Array(signatures(
-            provider,
-            &device,
-            &possession_input,
-            "device-possession",
-        ));
+        sort_devices(&mut genesis);
+        for index in 0..genesis["authorizedDevices"]
+            .as_array()
+            .expect("roster")
+            .len()
+        {
+            let signer = if genesis["authorizedDevices"][index]["endpointIdentityRef"]
+                == json!(hex(&endpoint_identity_ref))
+            {
+                &device
+            } else {
+                &second_device
+            };
+            sign_device_possession(provider, &mut genesis, signer, index);
+        }
         sign_state(provider, &mut genesis, &management, "authority-genesis")
             .expect("genesis signature");
         let accepted = validate_user_authority_state(
@@ -764,27 +837,42 @@ mod tests {
             &genesis,
             None,
             line_id,
-            &[endpoint_keys(
-                &device,
-                &endpoint_identity_ref,
-                &identity_state_digest,
-            )],
+            &[
+                endpoint_keys(&device, &endpoint_identity_ref, &identity_state_digest),
+                endpoint_keys(
+                    &second_device,
+                    &second_endpoint_identity_ref,
+                    &second_identity_state_digest,
+                ),
+            ],
         )
         .expect("genesis authority");
         Fixture {
             genesis,
             accepted,
             line_id,
-            keys: vec![ReplacementEndpointKeys {
-                endpoint_identity_ref: hex(&endpoint_identity_ref),
-                identity_state_digest: hex(&identity_state_digest),
-                ed25519_key_id: hex(&device.ed25519_key_id),
-                ed25519_public: hex(&device.ed25519_public),
-                ml_dsa_65_key_id: hex(&device.ml_dsa_65_key_id),
-                ml_dsa_65_public: hex(&device.ml_dsa_65_public),
-            }],
+            keys: vec![
+                ReplacementEndpointKeys {
+                    endpoint_identity_ref: hex(&endpoint_identity_ref),
+                    identity_state_digest: hex(&identity_state_digest),
+                    ed25519_key_id: hex(&device.ed25519_key_id),
+                    ed25519_public: hex(&device.ed25519_public),
+                    ml_dsa_65_key_id: hex(&device.ml_dsa_65_key_id),
+                    ml_dsa_65_public: hex(&device.ml_dsa_65_public),
+                },
+                ReplacementEndpointKeys {
+                    endpoint_identity_ref: hex(&second_endpoint_identity_ref),
+                    identity_state_digest: hex(&second_identity_state_digest),
+                    ed25519_key_id: hex(&second_device.ed25519_key_id),
+                    ed25519_public: hex(&second_device.ed25519_public),
+                    ml_dsa_65_key_id: hex(&second_device.ml_dsa_65_key_id),
+                    ml_dsa_65_public: hex(&second_device.ml_dsa_65_public),
+                },
+            ],
             endpoint_identity_ref,
             identity_state_digest,
+            second_endpoint_identity_ref,
+            second_identity_state_digest,
         }
     }
 
@@ -813,6 +901,83 @@ mod tests {
         sign_state(provider, &mut replaced, &recovery, "authority-recovery")
             .expect("recovery authority signature");
         replaced
+    }
+
+    /// A real device replacement: one management transition retires the
+    /// fixture's first device and admits a new endpoint in the same step.
+    /// Returns the signed record and the new device's key set.
+    fn device_replacement_transition(
+        provider: &impl Provider,
+        fixture: &Fixture,
+    ) -> (Value, ReplacementEndpointKeys) {
+        let management = pair(provider, "management", 10);
+        let new_device = pair(provider, "management", 80);
+        let new_ref = provider.sha256(b"synthetic-replacement:endpoint-new");
+        let new_digest = provider.sha256(b"synthetic-replacement:endpoint-state-new");
+        let mut replaced =
+            successor_skeleton(provider, &fixture.genesis, &management, "management")
+                .expect("successor skeleton");
+        let source_index = device_index(&replaced, &hex(&fixture.endpoint_identity_ref));
+        replaced["authorizedDevices"][source_index]["deviceStatus"] = json!("revoked");
+        replaced["authorizedDevices"][source_index]["revokedAuthorityEpoch"] = json!(1);
+        replaced["authorizedDevices"]
+            .as_array_mut()
+            .expect("roster")
+            .push(device_entry(&new_ref, &new_digest, &new_device, 1));
+        sort_devices(&mut replaced);
+        let new_index = device_index(&replaced, &hex(&new_ref));
+        sign_device_possession(provider, &mut replaced, &new_device, new_index);
+        sign_state(provider, &mut replaced, &management, "authority-management")
+            .expect("management authority signature");
+        (
+            replaced,
+            ReplacementEndpointKeys {
+                endpoint_identity_ref: hex(&new_ref),
+                identity_state_digest: hex(&new_digest),
+                ed25519_key_id: hex(&new_device.ed25519_key_id),
+                ed25519_public: hex(&new_device.ed25519_public),
+                ml_dsa_65_key_id: hex(&new_device.ml_dsa_65_key_id),
+                ml_dsa_65_public: hex(&new_device.ml_dsa_65_public),
+            },
+        )
+    }
+
+    /// A signed management transition that revokes one device and changes
+    /// nothing else.
+    fn revocation_transition(
+        provider: &impl Provider,
+        previous: &Value,
+        revoked_ref: &[u8; 32],
+    ) -> Value {
+        let management = pair(provider, "management", 10);
+        let epoch = previous["authorityEpoch"]
+            .as_u64()
+            .expect("the predecessor carries an epoch")
+            + 1;
+        let mut revoked = successor_skeleton(provider, previous, &management, "management")
+            .expect("successor skeleton");
+        let index = device_index(&revoked, &hex(revoked_ref));
+        revoked["authorizedDevices"][index]["deviceStatus"] = json!("revoked");
+        revoked["authorizedDevices"][index]["revokedAuthorityEpoch"] = json!(epoch);
+        sign_state(provider, &mut revoked, &management, "authority-management")
+            .expect("management authority signature");
+        revoked
+    }
+
+    /// A signed management successor that changes nothing: the SDK admits it,
+    /// and it is the transition that must not be spent on a roster claim.
+    fn no_op_transition(provider: &impl Provider, previous: &Value) -> Value {
+        let management = pair(provider, "management", 10);
+        let mut successor = successor_skeleton(provider, previous, &management, "management")
+            .expect("successor skeleton");
+        sign_state(
+            provider,
+            &mut successor,
+            &management,
+            "authority-management",
+        )
+        .expect("management authority signature");
+        successor
     }
 
     fn admission(fixture: &Fixture) -> ReplacementAdmission {
@@ -1138,6 +1303,292 @@ mod tests {
                 .catch_up(std::slice::from_ref(&fixture.genesis), &cold(&fixture))
                 .expect_err("the accepted epoch is not a successor"),
             ReplacementAdmissionRefusal::VerificationRefused
+        );
+    }
+
+    /// The composition's binding, exercised with a real signed replacement.
+    ///
+    /// The transition retires the fixture's first device and admits a new
+    /// endpoint in one signed step; the claim that names exactly that change
+    /// is the only one the verified record authorizes.
+    #[test]
+    #[ignore = "requires LICOARC_AUTHORITY_BUNDLE and real ml-dsa-65 signing"]
+    fn a_signed_replacement_authorizes_only_the_change_it_made() {
+        let provider = RustCryptoProvider;
+        let fixture = fixture(&provider);
+        let (replaced, new_keys) = device_replacement_transition(&provider, &fixture);
+        let subject = hex(&fixture.accepted.user_identity_ref);
+        let source = hex(&fixture.endpoint_identity_ref);
+        let destination = new_keys.endpoint_identity_ref.clone();
+        let bytes = authority_bytes();
+        let line = crate::AuthorityInput::new(&bytes)
+            .admit()
+            .expect("the fixed Candidate is admitted");
+        let adapter = SdkReplacementAuthority::with_admitted_line(line);
+
+        let mut endpoints = fixture.keys.clone();
+        endpoints.push(new_keys);
+        let cold_request = ColdReplacementRequest::new(
+            AuthoritySource::SavedRecoveryCredential,
+            ReplacementBinding::new(
+                &subject,
+                &source,
+                &destination,
+                ReplacementOperation::Activate,
+            ),
+            ColdAdmission {
+                predecessor: Some(ReplacementPredecessor::new(fixture.accepted.clone())),
+                endpoints: endpoints.clone(),
+            },
+        );
+
+        // Cold admission: the self-verifying record authorizes the replacement.
+        let (claim, verified) =
+            admit_replacement_cold_with_authority(&adapter, &replaced, &cold_request)
+                .expect("a signed replacement admits the claim it made");
+        assert_eq!(claim.operation(), ReplacementOperation::Activate);
+        assert_eq!(claim.subject_identity_ref(), subject);
+        assert_eq!(claim.source_device(), source);
+        assert_eq!(claim.new_endpoint_identity_ref(), destination);
+        assert_eq!(claim.authority_epoch(), 1);
+        // The source device the destination superseded was admitted at epoch 0.
+        assert_eq!(claim.superseded_epoch(), Some(0));
+        assert_eq!(verified.state(), &replaced);
+
+        // Snapshot catch-up reaches the same claim from the same record.
+        let tip =
+            admit_replacement_catch_up(&adapter, std::slice::from_ref(&replaced), &cold_request);
+        let tip = tip.accepted().expect("catch-up admits the same claim");
+        assert_eq!(tip.authority_epoch(), 1);
+        assert_eq!(tip.superseded_epoch(), Some(0));
+
+        // The session path admits the same signed transition; the still-active
+        // second device is the session's presenting endpoint, because the
+        // replaced source is no longer active.
+        let request = ReplacementRequest::new(
+            AuthoritySource::TrustedDevice,
+            ReplacementBinding::new(
+                &subject,
+                &source,
+                &destination,
+                ReplacementOperation::Activate,
+            ),
+            ReplacementAdmission {
+                predecessor: Some(ReplacementPredecessor::new(fixture.accepted.clone())),
+                session: ReplacementSession {
+                    authenticated: true,
+                    authority_state_digest: verified.state_digest(),
+                    endpoint_identity_ref: fixture.second_endpoint_identity_ref,
+                    identity_state_digest: fixture.second_identity_state_digest,
+                },
+                endpoints,
+            },
+        );
+        let (session_claim, _) = admit_replacement_with_authority(&adapter, &replaced, &request)
+            .expect("the session path admits the same replacement");
+        assert_eq!(session_claim.authority_epoch(), 1);
+        assert_eq!(session_claim.superseded_epoch(), Some(0));
+
+        // The same verified transition refuses every claim it did not make:
+        // an already-active destination is not activated by it, and a Revoke
+        // claim finds no revocation in it.
+        let mut stale = cold_request.clone();
+        stale.binding = ReplacementBinding::new(
+            &subject,
+            &source,
+            hex(&fixture.second_endpoint_identity_ref),
+            ReplacementOperation::Activate,
+        );
+        let refusal = admit_replacement_cold(&adapter, &replaced, &stale);
+        assert_eq!(
+            refusal.refusal(),
+            Some(ReplacementAuthorityRefusal::DestinationAlreadyActive),
+            "the still-active second device was not activated by this transition"
+        );
+        let mut revoke = cold_request;
+        revoke.binding = ReplacementBinding::new(
+            &subject,
+            &source,
+            &destination,
+            ReplacementOperation::Revoke,
+        );
+        let refusal = admit_replacement_cold(&adapter, &replaced, &revoke);
+        assert_eq!(
+            refusal.refusal(),
+            Some(ReplacementAuthorityRefusal::OperationMismatch),
+            "the transition performed an activation, not a revocation"
+        );
+    }
+
+    /// The cold paths bind a Revoke claim to the actual verified roster change
+    /// and refuse every transition that never made it.
+    #[test]
+    #[ignore = "requires LICOARC_AUTHORITY_BUNDLE and real ml-dsa-65 signing"]
+    fn an_unrelated_signed_transition_authorizes_no_claim() {
+        let provider = RustCryptoProvider;
+        let fixture = fixture(&provider);
+        let (replaced, new_keys) = device_replacement_transition(&provider, &fixture);
+        let subject = hex(&fixture.accepted.user_identity_ref);
+        let source = hex(&fixture.endpoint_identity_ref);
+        let destination = new_keys.endpoint_identity_ref.clone();
+        let bytes = authority_bytes();
+        let line = crate::AuthorityInput::new(&bytes)
+            .admit()
+            .expect("the fixed Candidate is admitted");
+        let adapter = SdkReplacementAuthority::with_admitted_line(line);
+
+        let mut endpoints = fixture.keys.clone();
+        endpoints.push(new_keys);
+        let cold = ColdAdmission {
+            predecessor: Some(ReplacementPredecessor::new(fixture.accepted.clone())),
+            endpoints: endpoints.clone(),
+        };
+
+        // (a) A recovery key rotation leaves the roster untouched: the
+        // already-active second device is not activated by it, and the source
+        // device it names is not retired by it either.
+        let rotated = replacement_transition(&provider, &fixture);
+        let request = ColdReplacementRequest::new(
+            AuthoritySource::SavedRecoveryCredential,
+            ReplacementBinding::new(
+                &subject,
+                &source,
+                hex(&fixture.second_endpoint_identity_ref),
+                ReplacementOperation::Activate,
+            ),
+            cold.clone(),
+        );
+        assert_eq!(
+            admit_replacement_cold(&adapter, &rotated, &request).refusal(),
+            Some(ReplacementAuthorityRefusal::DestinationAlreadyActive)
+        );
+
+        // (b) The destination must have superseded the named source: a
+        // transition that admits a new device without retiring the source
+        // made no replacement the claim binds.
+        let admitted_only = {
+            let management = pair(&provider, "management", 10);
+            let mut state =
+                successor_skeleton(&provider, &fixture.genesis, &management, "management")
+                    .expect("successor skeleton");
+            state["authorizedDevices"]
+                .as_array_mut()
+                .expect("roster")
+                .push(device_entry(
+                    &provider.sha256(b"synthetic-replacement:endpoint-new"),
+                    &provider.sha256(b"synthetic-replacement:endpoint-state-new"),
+                    &pair(&provider, "management", 80),
+                    1,
+                ));
+            sort_devices(&mut state);
+            let index = device_index(&state, &destination);
+            sign_device_possession(
+                &provider,
+                &mut state,
+                &pair(&provider, "management", 80),
+                index,
+            );
+            sign_state(&provider, &mut state, &management, "authority-management")
+                .expect("management authority signature");
+            state
+        };
+        let request = ColdReplacementRequest::new(
+            AuthoritySource::SavedRecoveryCredential,
+            ReplacementBinding::new(
+                &subject,
+                &source,
+                &destination,
+                ReplacementOperation::Activate,
+            ),
+            cold.clone(),
+        );
+        assert_eq!(
+            admit_replacement_cold(&adapter, &admitted_only, &request).refusal(),
+            Some(ReplacementAuthorityRefusal::SourceDeviceMismatch),
+            "the source stayed active, so the transition replaced nothing"
+        );
+
+        // (c) A real revocation at epoch 2 is admitted and bound to the
+        // destination's own admission epoch as the superseded one.
+        let accepted_replacement = adapter
+            .admit_state(&replaced, &cold)
+            .expect("the replacement admits cold");
+        let revoked = revocation_transition(
+            &provider,
+            &replaced,
+            &super::decode_hex_32(&destination).expect("hex destination ref"),
+        );
+        let revoke_cold = ColdAdmission {
+            predecessor: Some(ReplacementPredecessor::new(
+                accepted_replacement.authority().clone(),
+            )),
+            endpoints: endpoints.clone(),
+        };
+        let revoke_request = ColdReplacementRequest::new(
+            AuthoritySource::SavedRecoveryCredential,
+            ReplacementBinding::new(
+                &subject,
+                &source,
+                &destination,
+                ReplacementOperation::Revoke,
+            ),
+            revoke_cold,
+        );
+        let decision = admit_replacement_cold(&adapter, &revoked, &revoke_request);
+        let claim = decision
+            .accepted()
+            .expect("a signed revocation admits the claim it made");
+        assert_eq!(claim.operation(), ReplacementOperation::Revoke);
+        assert_eq!(claim.authority_epoch(), 2);
+        assert_eq!(claim.superseded_epoch(), Some(1));
+        let tip =
+            admit_replacement_catch_up(&adapter, std::slice::from_ref(&revoked), &revoke_request);
+        assert_eq!(
+            tip.accepted()
+                .expect("catch-up admits the same revocation")
+                .authority_epoch(),
+            2
+        );
+
+        // (d) A signed no-op successor revokes nothing: the already-revoked
+        // destination is not revoked again by a later unrelated transition.
+        let accepted_revoked = adapter
+            .admit_state(
+                &revoked,
+                &ColdAdmission {
+                    predecessor: Some(ReplacementPredecessor::new(
+                        accepted_replacement.authority().clone(),
+                    )),
+                    endpoints: endpoints.clone(),
+                },
+            )
+            .expect("the revocation admits cold");
+        let noop = no_op_transition(&provider, &revoked);
+        let noop_request = ColdReplacementRequest::new(
+            AuthoritySource::SavedRecoveryCredential,
+            ReplacementBinding::new(
+                &subject,
+                &source,
+                &destination,
+                ReplacementOperation::Revoke,
+            ),
+            ColdAdmission {
+                predecessor: Some(ReplacementPredecessor::new(
+                    accepted_revoked.into_authority(),
+                )),
+                endpoints,
+            },
+        );
+        assert_eq!(
+            admit_replacement_cold(&adapter, &noop, &noop_request).refusal(),
+            Some(ReplacementAuthorityRefusal::OperationMismatch),
+            "the destination was revoked by an earlier transition, not this one"
+        );
+        assert_eq!(
+            admit_replacement_catch_up(&adapter, std::slice::from_ref(&noop), &noop_request)
+                .refusal(),
+            Some(ReplacementAuthorityRefusal::OperationMismatch),
+            "catch-up binds the claim to the tip's change the same way"
         );
     }
 }

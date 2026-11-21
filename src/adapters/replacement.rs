@@ -20,15 +20,17 @@
 //!   reached, so a superseded roster is never re-verified into acceptance.
 //! * **the subject** — the verified record's `userIdentityRef` must be the
 //!   subject the binding names.
-//! * **the operation** — the successor roster's device status for the
-//!   destination decides whether the transition activates or revokes, and the
-//!   binding's operation must be that one.
+//! * **the operation** — the destination's `deviceStatus` must be the one the
+//!   binding names, and the epoch the SDK stamped on it
+//!   (`admittedAuthorityEpoch` / `revokedAuthorityEpoch`) must fall inside the
+//!   verified span, so a status an earlier transition wrote never authorizes
+//!   this request.
 //! * **the new identity** — the destination must be a distinct endpoint the
-//!   successor roster really holds at this epoch, never the source identity
-//!   itself, so new endpoint keys never derive from an imported source identity.
-//! * **the source device** — the successor roster must account for it, so
-//!   authority that never mentions the device being replaced belongs to another
-//!   replacement.
+//!   successor roster really holds, never the source identity itself, so new
+//!   endpoint keys never derive from an imported source identity.
+//! * **the source device** — the destination must have superseded it: the
+//!   source's entry is `revoked` at the destination's own admission epoch, so
+//!   a signed transition that never replaced it belongs to another request.
 
 use crate::{
     AcceptedReplacement, AuthoritySource, ReplacementAuthority, ReplacementAuthorityRefusal,
@@ -227,7 +229,7 @@ fn verify_replacement(
     state: &Value,
     request: &ReplacementRequest,
 ) -> Result<VerifiedBinding, ReplacementAuthorityRefusal> {
-    let superseded_epoch = admit_preflight(
+    let accepted_epoch = admit_preflight(
         request.source,
         &request.binding,
         request.admission.predecessor.as_ref(),
@@ -239,7 +241,7 @@ fn verify_replacement(
     let verified = authority
         .admit(state, &request.admission)
         .map_err(map_admission_refusal)?;
-    verify_binding(verified, request.source, &request.binding, superseded_epoch)
+    verify_binding(verified, request.source, &request.binding, accepted_epoch)
 }
 
 fn verify_replacement_cold(
@@ -247,7 +249,7 @@ fn verify_replacement_cold(
     state: &Value,
     request: &ColdReplacementRequest,
 ) -> Result<VerifiedBinding, ReplacementAuthorityRefusal> {
-    let superseded_epoch = admit_preflight(
+    let accepted_epoch = admit_preflight(
         request.source,
         &request.binding,
         request.admission.predecessor.as_ref(),
@@ -256,7 +258,7 @@ fn verify_replacement_cold(
     let verified = authority
         .admit_state(state, &request.admission)
         .map_err(map_admission_refusal)?;
-    verify_binding(verified, request.source, &request.binding, superseded_epoch)
+    verify_binding(verified, request.source, &request.binding, accepted_epoch)
 }
 
 fn verify_replacement_catch_up(
@@ -267,7 +269,7 @@ fn verify_replacement_catch_up(
     // The replay guard reads the tip's epoch; an empty chain has no tip, so a
     // caller with an accepted epoch reads an unreadable authority, and a caller
     // without one is refused by the SDK's own empty-chain bound.
-    let superseded_epoch = admit_preflight(
+    let accepted_epoch = admit_preflight(
         request.source,
         &request.binding,
         request.admission.predecessor.as_ref(),
@@ -276,15 +278,19 @@ fn verify_replacement_catch_up(
     let verified = authority
         .catch_up(snapshots, &request.admission)
         .map_err(map_admission_refusal)?;
-    verify_binding(verified, request.source, &request.binding, superseded_epoch)
+    verify_binding(verified, request.source, &request.binding, accepted_epoch)
 }
 
 /// The binding comparison, against the verified record's own values.
+///
+/// `accepted_epoch` is the epoch the caller already accepted, if any: the
+/// verified span is `(accepted_epoch, tip_epoch]`, and the claimed change must
+/// have been made inside it.
 fn verify_binding(
     verified: VerifiedReplacementAuthority,
     source: AuthoritySource,
     binding: &ReplacementBinding,
-    superseded_epoch: Option<u64>,
+    accepted_epoch: Option<u64>,
 ) -> Result<VerifiedBinding, ReplacementAuthorityRefusal> {
     let verified_state = verified.state();
 
@@ -298,27 +304,56 @@ fn verify_binding(
 
     let destination = read_device(verified_state, binding.new_endpoint_identity_ref())
         .ok_or(ReplacementAuthorityRefusal::NewIdentityMismatch)?;
-    let operation = match read_text(destination, "deviceStatus")? {
-        "active" => ReplacementOperation::Activate,
-        "revoked" => ReplacementOperation::Revoke,
-        _ => return Err(ReplacementAuthorityRefusal::NewIdentityMismatch),
+    let admitted = read_epoch_field(destination, "admittedAuthorityEpoch")?;
+    let status = read_text(destination, "deviceStatus")?;
+
+    // 5. The verified chain must have made the claimed change itself. The SDK
+    //    marks every roster write with the epoch of the transition that made
+    //    it (`validate_roster_transition`, `src/identity.rs`), so a status an
+    //    earlier transition already held authorizes nothing here: an unrelated
+    //    transition can neither activate an already-active destination nor
+    //    revoke an already-revoked one.
+    let floor = accepted_epoch.map_or(0, |epoch| epoch.saturating_add(1));
+    let changed_at = match (binding.operation(), status) {
+        (ReplacementOperation::Activate, "active") => admitted,
+        (ReplacementOperation::Revoke, "revoked") => {
+            read_epoch_field(destination, "revokedAuthorityEpoch")?
+        }
+        _ => return Err(ReplacementAuthorityRefusal::OperationMismatch),
     };
-    if operation != binding.operation() {
-        return Err(ReplacementAuthorityRefusal::OperationMismatch);
+    if changed_at < floor {
+        return Err(match binding.operation() {
+            ReplacementOperation::Activate => ReplacementAuthorityRefusal::DestinationAlreadyActive,
+            ReplacementOperation::Revoke => ReplacementAuthorityRefusal::OperationMismatch,
+        });
     }
 
-    // The successor roster must account for the device being replaced. An
-    // authority that never mentions it is about a different replacement.
-    if read_device(verified_state, binding.source_device()).is_none() {
-        return Err(ReplacementAuthorityRefusal::SourceDeviceMismatch);
+    // 6. The source device is the one the destination superseded: the
+    //    transition that admitted the destination revoked it, so its roster
+    //    entry is `revoked` at the destination's own admission epoch. Merely
+    //    naming a roster member binds the claim to nothing.
+    let source_device = read_device(verified_state, binding.source_device())
+        .ok_or(ReplacementAuthorityRefusal::SourceDeviceMismatch)?;
+    match read_text(source_device, "deviceStatus")? {
+        "revoked" if read_epoch_field(source_device, "revokedAuthorityEpoch")? == admitted => {}
+        _ => return Err(ReplacementAuthorityRefusal::SourceDeviceMismatch),
     }
+
+    // The epoch a revocation supersedes is the admission epoch of the device
+    // the claim retires — read from the verified record, not inherited.
+    let superseded_epoch = match binding.operation() {
+        ReplacementOperation::Activate => {
+            read_epoch_field(source_device, "admittedAuthorityEpoch")?
+        }
+        ReplacementOperation::Revoke => admitted,
+    };
 
     let claim = AcceptedReplacement::verified(
         source,
         binding,
         verified.authority_epoch(),
         verified.state_digest(),
-        superseded_epoch,
+        Some(superseded_epoch),
     );
     Ok(VerifiedBinding {
         claim,
@@ -327,8 +362,12 @@ fn verify_binding(
 }
 
 fn read_epoch(state: &Value) -> Result<u64, ReplacementAuthorityRefusal> {
-    state
-        .get("authorityEpoch")
+    read_epoch_field(state, "authorityEpoch")
+}
+
+fn read_epoch_field(value: &Value, key: &str) -> Result<u64, ReplacementAuthorityRefusal> {
+    value
+        .get(key)
         .and_then(Value::as_u64)
         .ok_or(ReplacementAuthorityRefusal::UnreadableAuthority)
 }
