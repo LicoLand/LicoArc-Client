@@ -829,13 +829,13 @@ async fn a_successful_connect_resets_the_backoff() {
     let policy = ReconnectPolicy {
         initial: Duration::from_millis(40),
         multiplier: 4,
-        cap: Duration::from_millis(500),
+        cap: Duration::from_millis(1_500),
     };
 
     let driver = async {
-        // Three failed attempts grow the wait: 40, then 160, then the
-        // 500 cap — the next wait is the grown value. Wait for the third
-        // socket to be dropped, not merely accepted, before enabling
+        // Three failed attempts grow the wait: 40, then 160, then 640 —
+        // the next wait is the grown value at the 1_500 cap. Wait for the
+        // third socket to be dropped, not merely accepted, before enabling
         // service so the mode flip cannot race the fixture's mode read.
         wait_dropped(&station.store, 3, Duration::from_secs(15)).await;
         station.mode.send(Mode::Serve).unwrap();
@@ -868,10 +868,13 @@ async fn a_successful_connect_resets_the_backoff() {
         accepts.len()
     );
     // accepts[2] → accepts[3] spans the grown wait after three failures:
-    // jitter(500) ≥ 500 ms. accepts[3] is the successful connect and
+    // jitter(640) ≥ 640 ms. accepts[3] is the successful connect and
     // accepts[4] the first attempt after it was killed — their gap is the
-    // reset wait, jitter(40) ≤ 60 ms plus a small margin, far below the
-    // grown value an un-reset cadence would show.
+    // reset wait plus the killed connection's teardown and a fresh dial,
+    // whose turnaround time is not part of the cadence. An un-reset cadence
+    // could only produce a gap at or above `cap` — the grown wait alone is
+    // jitter(1_500) ≥ 1_500 ms — so a gap strictly below `cap` can only
+    // come from the reset wait, jitter(40) ≤ 60 ms plus turnaround.
     let grown_gap = accepts[3] - accepts[2];
     assert!(
         grown_gap >= Duration::from_millis(400),
@@ -879,7 +882,7 @@ async fn a_successful_connect_resets_the_backoff() {
     );
     let reset_gap = accepts[4] - accepts[3];
     assert!(
-        reset_gap <= Duration::from_millis(40).mul_f64(1.5) + Duration::from_millis(200),
-        "reset gap {reset_gap:?} shows the grown backoff was not reset"
+        reset_gap < policy.cap,
+        "reset gap {reset_gap:?} is at or above the smallest grown wait — the backoff was not reset"
     );
 }

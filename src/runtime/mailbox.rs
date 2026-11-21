@@ -125,7 +125,20 @@ async fn drive<S: PacketSink>(
     loop {
         let event = tokio::select! {
             event = client.next() => event,
-            _ = stop.changed() => return DriveOutcome::Stopped,
+            changed = stop.changed() => {
+                match changed {
+                    Ok(()) => {
+                        // A `false` update is not a stop request — the same
+                        // rule `paced_wait` applies during backoff. Only a
+                        // real stop or a closed channel ends the receiver.
+                        if *stop.borrow() {
+                            return DriveOutcome::Stopped;
+                        }
+                        continue;
+                    }
+                    Err(_) => return DriveOutcome::Stopped,
+                }
+            }
         };
         match event {
             Err(

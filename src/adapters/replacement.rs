@@ -33,7 +33,10 @@
 //!   existing active endpoint's identity-state digest changes, so the
 //!   roster immediately before that transition — a chain snapshot at
 //!   `admitted - 1`, or the accepted predecessor when it is that record —
-//!   must not already hold the destination.
+//!   must not already hold the destination. When the accepted predecessor
+//!   is itself the admission record, the fresh-admission proof its
+//!   acceptance retained must name the destination instead — the record
+//!   alone still cannot prove the endpoint was new.
 //! * **the source device** — the destination must have superseded it: the
 //!   source's entry is `revoked` at the destination's own admission epoch,
 //!   decided on the verified record that recorded that transition — a
@@ -403,11 +406,14 @@ fn verify_binding(
     //    The roster immediately before the transition decides — a genuinely
     //    new destination is absent from it. That roster is a chain snapshot
     //    at `admitted - 1`, or the accepted predecessor when it is that
-    //    record. When the predecessor *is* the admission record its own
-    //    verified state is already the caller's anchor, and a genesis
-    //    admission (`admitted == 0`) has no roster before it; any other
-    //    claim must carry the pre-admission record among its verified
-    //    evidence or be refused.
+    //    record. When the predecessor *is* the admission record, only the
+    //    fresh-admission proof its own acceptance retained — the endpoints
+    //    the SDK-verified transition newly rostered — can stand in for it:
+    //    the accepted record alone still cannot prove the destination was
+    //    new, and an already-rostered endpoint whose admission epoch was
+    //    restamped must not qualify. A genesis admission (`admitted == 0`)
+    //    has no roster before it; any other claim must carry the
+    //    pre-admission record among its verified evidence or be refused.
     let before = admitted.checked_sub(1).and_then(|prior| {
         records
             .iter()
@@ -422,7 +428,11 @@ fn verify_binding(
         if read_device(before, binding.new_endpoint_identity_ref()).is_some() {
             return Err(ReplacementAuthorityRefusal::SourceDeviceMismatch);
         }
-    } else if admitted != 0 && predecessor.is_none_or(|predecessor| predecessor.epoch() != admitted)
+    } else if admitted != 0
+        && !predecessor.is_some_and(|predecessor| {
+            predecessor.epoch() == admitted
+                && predecessor.proves_fresh_admission(binding.new_endpoint_identity_ref())
+        })
     {
         return Err(ReplacementAuthorityRefusal::SourceDeviceMismatch);
     }
