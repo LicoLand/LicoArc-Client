@@ -14,12 +14,14 @@
 //! | the new-device possession proof | reached inside the same entry, `src/identity.rs` |
 //! | the replacement possession proof over the new authority keys | same entry, `src/identity.rs`; the message is `replacement_possession_input`, `src/identity.rs` |
 //! | the authenticated session, its authority digest and its active device entry | `admit_protected_authority_payload`, `src/identity.rs` |
+//! | a self-verifying record with no session | `validate_user_authority_state`, `src/identity.rs` |
+//! | a snapshot chain catching up missed transitions | `apply_user_authority_catch_up`, `src/identity.rs` |
 //!
 //! Nothing here re-verifies a signature and no local type mirrors an SDK type:
-//! the adapter calls [`licoarc::identity::admit_protected_authority_payload`] and
-//! returns the SDK's own [`AcceptedUserAuthority`]. `verify_replacement_possession`
+//! the adapter calls the SDK entries above and returns the SDK's own
+//! [`AcceptedUserAuthority`]. `verify_replacement_possession`
 //! is private in the SDK (`src/identity.rs`) and is deliberately *not*
-//! re-implemented here; it is reached only through the two public entries above.
+//! re-implemented here; it is reached only through the public entries above.
 //!
 //! # Why the binding lives elsewhere
 //!
@@ -41,7 +43,8 @@
 
 use licoarc::identity::{
     AcceptedUserAuthority, AuthenticatedAuthoritySession, EndpointStateKeys,
-    admit_protected_authority_payload,
+    admit_protected_authority_payload, apply_user_authority_catch_up,
+    validate_user_authority_state,
 };
 use licoarc::provider::RustCryptoProvider;
 use serde_json::Value;
@@ -203,6 +206,23 @@ pub struct ReplacementAdmission {
     pub predecessor: Option<ReplacementPredecessor>,
     /// The authenticated session facts the transition arrived on.
     pub session: ReplacementSession,
+    /// The local device keys known to the caller, for possession verification.
+    pub endpoints: Vec<ReplacementEndpointKeys>,
+}
+
+/// Everything the SDK needs to decide authority material that arrived with no
+/// authenticated session.
+///
+/// A saved recovery credential, an offline export or an untrusted relay hands
+/// the caller a signed authority record before any session could have
+/// authenticated it. The SDK validates the record itself — the signed
+/// transition, the epoch chain and the possession proofs are self-verifying
+/// (`validate_user_authority_state`, `apply_user_authority_catch_up`,
+/// `src/identity.rs`), so no `ReplacementSession` exists here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdAdmission {
+    /// The authority the caller already accepted, if any.
+    pub predecessor: Option<ReplacementPredecessor>,
     /// The local device keys known to the caller, for possession verification.
     pub endpoints: Vec<ReplacementEndpointKeys>,
 }
@@ -398,6 +418,76 @@ impl SdkReplacementAuthority {
         .map(|authority| VerifiedReplacementAuthority { authority })
         .map_err(|_cause: crate::Error| ReplacementAdmissionRefusal::VerificationRefused)
     }
+
+    /// Admits one authority state that arrived with no authenticated session,
+    /// or refuses before any caller-owned effect.
+    ///
+    /// The decision is the SDK's: [`licoarc::identity::validate_user_authority_state`]
+    /// verifies the signed transition, the epoch chain against the caller's
+    /// accepted predecessor and the possession proofs — the record is
+    /// self-verifying, which is what a saved recovery credential or an
+    /// offline record can deliver. This method adds no policy of its own.
+    pub fn admit_state(
+        &self,
+        state: &Value,
+        admission: &ColdAdmission,
+    ) -> Result<VerifiedReplacementAuthority, ReplacementAdmissionRefusal> {
+        let Some(line) = self.line.as_ref() else {
+            return Err(ReplacementAdmissionRefusal::NoAdmittedLine);
+        };
+        let endpoints = admission
+            .endpoints
+            .iter()
+            .map(ReplacementEndpointKeys::to_sdk)
+            .collect::<Result<Vec<EndpointStateKeys>, ReplacementAdmissionRefusal>>()?;
+        validate_user_authority_state(
+            &RustCryptoProvider,
+            state,
+            admission
+                .predecessor
+                .as_ref()
+                .map(|predecessor| predecessor.state()),
+            *line.protocol_line_id(),
+            &endpoints,
+        )
+        .map(|authority| VerifiedReplacementAuthority { authority })
+        .map_err(|_cause: crate::Error| ReplacementAdmissionRefusal::VerificationRefused)
+    }
+
+    /// Admits a chain of authority snapshots with no authenticated session, or
+    /// refuses before any caller-owned effect.
+    ///
+    /// A device that was offline across several transitions receives the
+    /// records it missed in order; [`licoarc::identity::apply_user_authority_catch_up`]
+    /// validates each against the one it succeeds, from the caller's accepted
+    /// predecessor, and returns the tip it verified. An empty chain is refused
+    /// by the SDK itself.
+    pub fn catch_up(
+        &self,
+        snapshots: &[Value],
+        admission: &ColdAdmission,
+    ) -> Result<VerifiedReplacementAuthority, ReplacementAdmissionRefusal> {
+        let Some(line) = self.line.as_ref() else {
+            return Err(ReplacementAdmissionRefusal::NoAdmittedLine);
+        };
+        let endpoints = admission
+            .endpoints
+            .iter()
+            .map(ReplacementEndpointKeys::to_sdk)
+            .collect::<Result<Vec<EndpointStateKeys>, ReplacementAdmissionRefusal>>()?;
+        apply_user_authority_catch_up(
+            &RustCryptoProvider,
+            admission
+                .predecessor
+                .as_ref()
+                .map(ReplacementPredecessor::as_sdk),
+            snapshots,
+            *line.protocol_line_id(),
+            &endpoints,
+        )
+        .map(|authority| VerifiedReplacementAuthority { authority })
+        .map_err(|_cause: crate::Error| ReplacementAdmissionRefusal::VerificationRefused)
+    }
 }
 
 fn decode_hex_32(value: &str) -> Result<[u8; 32], ReplacementAdmissionRefusal> {
@@ -443,7 +533,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ReplacementAdmission, ReplacementAdmissionRefusal, ReplacementEndpointKeys,
+        ColdAdmission, ReplacementAdmission, ReplacementAdmissionRefusal, ReplacementEndpointKeys,
         ReplacementPredecessor, ReplacementSession, SdkReplacementAuthority,
     };
     use crate::version::ACCEPTED_PROTOCOL_LINE_ID;
@@ -738,6 +828,15 @@ mod tests {
         }
     }
 
+    /// The cold counterpart of [`admission`]: the same predecessor and key
+    /// sets, and deliberately no session.
+    fn cold(fixture: &Fixture) -> ColdAdmission {
+        ColdAdmission {
+            predecessor: Some(ReplacementPredecessor::new(fixture.accepted.clone())),
+            endpoints: fixture.keys.clone(),
+        }
+    }
+
     /// The explicit read-only authority artifact the caller supplied.
     fn authority_bytes() -> Vec<u8> {
         let path = env::var_os("LICOARC_AUTHORITY_BUNDLE")
@@ -768,6 +867,30 @@ mod tests {
             adapter
                 .admit(&json!({"not": "a record"}), &admission)
                 .expect_err("no admitted line means no replacement authority"),
+            ReplacementAdmissionRefusal::NoAdmittedLine
+        );
+
+        // The sessionless paths refuse the same way before reading anything.
+        let cold = ColdAdmission {
+            predecessor: None,
+            endpoints: Vec::new(),
+        };
+        assert_eq!(
+            adapter
+                .admit_state(&json!({"not": "a record"}), &cold)
+                .expect_err("no admitted line means no cold admission"),
+            ReplacementAdmissionRefusal::NoAdmittedLine
+        );
+        assert_eq!(
+            adapter
+                .catch_up(&[json!({"not": "a record"})], &cold)
+                .expect_err("no admitted line means no catch-up"),
+            ReplacementAdmissionRefusal::NoAdmittedLine
+        );
+        assert_eq!(
+            adapter
+                .catch_up(&[], &cold)
+                .expect_err("an empty chain is refused before it is read"),
             ReplacementAdmissionRefusal::NoAdmittedLine
         );
     }
@@ -933,6 +1056,87 @@ mod tests {
             adapter
                 .admit(&replaced, &admission(&fixture))
                 .expect_err("a mutated record admits nothing"),
+            ReplacementAdmissionRefusal::VerificationRefused
+        );
+    }
+
+    /// The same recovery transition with no session at all: the record is
+    /// self-verifying, which is what a saved recovery credential delivers.
+    #[test]
+    #[ignore = "requires LICOARC_AUTHORITY_BUNDLE and real ml-dsa-65 signing"]
+    fn a_recovery_key_replacement_admits_without_a_session() {
+        let provider = RustCryptoProvider;
+        let fixture = fixture(&provider);
+        let replaced = replacement_transition(&provider, &fixture);
+        let bytes = authority_bytes();
+        let line = crate::AuthorityInput::new(&bytes)
+            .admit()
+            .expect("the fixed Candidate is admitted");
+        let adapter = SdkReplacementAuthority::with_admitted_line(line);
+
+        let verified = adapter
+            .admit_state(&replaced, &cold(&fixture))
+            .expect("the SDK admits the self-verifying record cold");
+        assert_eq!(verified.authority_epoch(), 1);
+        assert_eq!(verified.state(), &replaced);
+        assert_eq!(
+            verified.user_identity_ref(),
+            fixture.accepted.user_identity_ref
+        );
+    }
+
+    /// A genesis alone admits cold, and a missed transition catches up from
+    /// the accepted tip through a snapshot chain.
+    #[test]
+    #[ignore = "requires LICOARC_AUTHORITY_BUNDLE and real ml-dsa-65 signing"]
+    fn a_snapshot_chain_catches_up_the_missed_transition() {
+        let provider = RustCryptoProvider;
+        let fixture = fixture(&provider);
+        let replaced = replacement_transition(&provider, &fixture);
+        let bytes = authority_bytes();
+        let line = crate::AuthorityInput::new(&bytes)
+            .admit()
+            .expect("the fixed Candidate is admitted");
+        let adapter = SdkReplacementAuthority::with_admitted_line(line);
+
+        // With nothing accepted, one genesis record is the whole catch-up.
+        let from_nothing = ColdAdmission {
+            predecessor: None,
+            endpoints: fixture.keys.clone(),
+        };
+        let genesis = adapter
+            .admit_state(&fixture.genesis, &from_nothing)
+            .expect("genesis admits cold");
+        assert_eq!(genesis.authority_epoch(), 0);
+        assert_eq!(genesis.state_digest(), fixture.accepted.state_digest);
+
+        // The missed recovery transition arrives as the snapshot after the
+        // accepted tip; the SDK validates the chain and returns that tip.
+        let tip = adapter
+            .catch_up(std::slice::from_ref(&replaced), &cold(&fixture))
+            .expect("the chain catches up to the replacement");
+        assert_eq!(tip.authority_epoch(), 1);
+        assert_eq!(tip.state(), &replaced);
+
+        // From nothing at all, both snapshots validate to the same tip.
+        let tip = adapter
+            .catch_up(&[fixture.genesis.clone(), replaced.clone()], &from_nothing)
+            .expect("the full chain catches up");
+        assert_eq!(tip.authority_epoch(), 1);
+        assert_eq!(tip.state(), &replaced);
+
+        // An empty chain and a chain that does not advance are refused by the
+        // SDK itself.
+        assert_eq!(
+            adapter
+                .catch_up(&[], &cold(&fixture))
+                .expect_err("an empty chain admits nothing"),
+            ReplacementAdmissionRefusal::VerificationRefused
+        );
+        assert_eq!(
+            adapter
+                .catch_up(std::slice::from_ref(&fixture.genesis), &cold(&fixture))
+                .expect_err("the accepted epoch is not a successor"),
             ReplacementAdmissionRefusal::VerificationRefused
         );
     }

@@ -35,8 +35,8 @@ use crate::{
     ReplacementBinding, ReplacementOperation,
 };
 use crate::{
-    ReplacementAdmission, ReplacementAdmissionRefusal, SdkReplacementAuthority,
-    VerifiedReplacementAuthority,
+    ColdAdmission, ReplacementAdmission, ReplacementAdmissionRefusal, ReplacementPredecessor,
+    SdkReplacementAuthority, VerifiedReplacementAuthority,
 };
 use serde_json::Value;
 
@@ -58,6 +58,40 @@ impl ReplacementRequest {
         source: AuthoritySource,
         binding: ReplacementBinding,
         admission: ReplacementAdmission,
+    ) -> Self {
+        Self {
+            source,
+            binding,
+            admission,
+        }
+    }
+}
+
+/// One replacement request whose authority material arrived with no
+/// authenticated session.
+///
+/// This is the saved-recovery-credential shape: a fresh device holds an
+/// offline record or a relayed snapshot chain, not a live session from a
+/// roster device. The credential, replay and binding rules are identical to
+/// [`ReplacementRequest`]; only the SDK entry that verifies the material
+/// differs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdReplacementRequest {
+    /// Which accepted source the caller resolved for this request.
+    pub source: AuthoritySource,
+    /// The subject, source device, new identity and operation it is about.
+    pub binding: ReplacementBinding,
+    /// The authority facts the fixed SDK decides on, without a session.
+    pub admission: ColdAdmission,
+}
+
+impl ColdReplacementRequest {
+    /// Builds one cold request from the resolved credential and its binding.
+    #[must_use]
+    pub const fn new(
+        source: AuthoritySource,
+        binding: ReplacementBinding,
+        admission: ColdAdmission,
     ) -> Self {
         Self {
             source,
@@ -99,10 +133,93 @@ pub fn admit_replacement_with_authority(
     Ok((verified.claim, verified.authority))
 }
 
+/// Admits one replacement whose authority material arrived with no
+/// authenticated session, or refuses without a caller-owned effect.
+///
+/// The credential, replay and binding rules are the same as
+/// [`admit_replacement`]; the SDK verifies the self-authenticating record
+/// itself, which is what a saved recovery credential or an offline export can
+/// deliver.
+#[must_use]
+pub fn admit_replacement_cold(
+    authority: &SdkReplacementAuthority,
+    state: &Value,
+    request: &ColdReplacementRequest,
+) -> ReplacementAuthority {
+    match verify_replacement_cold(authority, state, request) {
+        Ok(verified) => ReplacementAuthority::Authorized(verified.claim),
+        Err(refusal) => ReplacementAuthority::Refused(refusal),
+    }
+}
+
+/// [`admit_replacement_cold`] keeping the SDK's accepted authority as well.
+pub fn admit_replacement_cold_with_authority(
+    authority: &SdkReplacementAuthority,
+    state: &Value,
+    request: &ColdReplacementRequest,
+) -> Result<(AcceptedReplacement, VerifiedReplacementAuthority), ReplacementAuthorityRefusal> {
+    let verified = verify_replacement_cold(authority, state, request)?;
+    Ok((verified.claim, verified.authority))
+}
+
+/// Admits one replacement from a chain of authority snapshots with no
+/// authenticated session, or refuses without a caller-owned effect.
+///
+/// A device that was offline across several transitions catches up through
+/// the snapshots it missed; the replay guard compares the tip snapshot's
+/// epoch against the caller's accepted epoch, and the binding compares the
+/// tip the SDK verified.
+#[must_use]
+pub fn admit_replacement_catch_up(
+    authority: &SdkReplacementAuthority,
+    snapshots: &[Value],
+    request: &ColdReplacementRequest,
+) -> ReplacementAuthority {
+    match verify_replacement_catch_up(authority, snapshots, request) {
+        Ok(verified) => ReplacementAuthority::Authorized(verified.claim),
+        Err(refusal) => ReplacementAuthority::Refused(refusal),
+    }
+}
+
+/// [`admit_replacement_catch_up`] keeping the SDK's accepted tip authority.
+pub fn admit_replacement_catch_up_with_authority(
+    authority: &SdkReplacementAuthority,
+    snapshots: &[Value],
+    request: &ColdReplacementRequest,
+) -> Result<(AcceptedReplacement, VerifiedReplacementAuthority), ReplacementAuthorityRefusal> {
+    let verified = verify_replacement_catch_up(authority, snapshots, request)?;
+    Ok((verified.claim, verified.authority))
+}
+
 /// What the composition verified, before it is reduced to one claim.
 struct VerifiedBinding {
     claim: AcceptedReplacement,
     authority: VerifiedReplacementAuthority,
+}
+
+/// The checks every path decides from caller-owned values before the SDK is
+/// reached: a credential that can authorize, and a presented record that
+/// advances past the epoch already accepted.
+fn admit_preflight(
+    source: AuthoritySource,
+    binding: &ReplacementBinding,
+    predecessor: Option<&ReplacementPredecessor>,
+    presented: &Value,
+) -> Result<Option<u64>, ReplacementAuthorityRefusal> {
+    // 1. The caller must really hold one of the two accepted sources. Ordinary
+    //    backup, relay and peer input arrives as `None` and stops here, before
+    //    any store, transport or effect is named.
+    if !source.can_authorize() {
+        return Err(ReplacementAuthorityRefusal::NoTrustedAuthority);
+    }
+
+    // 2. Replay is decided from the caller's own accepted epoch, so a superseded
+    //    roster is refused rather than re-verified into acceptance.
+    let accepted_epoch = predecessor.map(|predecessor| predecessor.epoch());
+    if let Some(accepted_epoch) = accepted_epoch {
+        binding.replayed_at(accepted_epoch, read_epoch(presented)?)?;
+    }
+    Ok(accepted_epoch)
 }
 
 fn verify_replacement(
@@ -110,33 +227,65 @@ fn verify_replacement(
     state: &Value,
     request: &ReplacementRequest,
 ) -> Result<VerifiedBinding, ReplacementAuthorityRefusal> {
-    let binding = &request.binding;
-
-    // 1. The caller must really hold one of the two accepted sources. Ordinary
-    //    backup, relay and peer input arrives as `None` and stops here, before
-    //    any store, transport or effect is named.
-    if !request.source.can_authorize() {
-        return Err(ReplacementAuthorityRefusal::NoTrustedAuthority);
-    }
-
-    // 2. Replay is decided from the caller's own accepted epoch, so a superseded
-    //    roster is refused rather than re-verified into acceptance.
-    let accepted_epoch = request
-        .admission
-        .predecessor
-        .as_ref()
-        .map_or(0, |predecessor| predecessor.epoch());
-    if request.admission.predecessor.is_some() {
-        let presented = read_epoch(state)?;
-        binding.replayed_at(accepted_epoch, presented)?;
-    }
-
+    let superseded_epoch = admit_preflight(
+        request.source,
+        &request.binding,
+        request.admission.predecessor.as_ref(),
+        state,
+    )?;
     // 3. The SDK's own decision on the transition, the possession proof and the
     //    authenticated session. The three are not separable from the caller's
     //    side, so every refusal is one class.
     let verified = authority
         .admit(state, &request.admission)
         .map_err(map_admission_refusal)?;
+    verify_binding(verified, request.source, &request.binding, superseded_epoch)
+}
+
+fn verify_replacement_cold(
+    authority: &SdkReplacementAuthority,
+    state: &Value,
+    request: &ColdReplacementRequest,
+) -> Result<VerifiedBinding, ReplacementAuthorityRefusal> {
+    let superseded_epoch = admit_preflight(
+        request.source,
+        &request.binding,
+        request.admission.predecessor.as_ref(),
+        state,
+    )?;
+    let verified = authority
+        .admit_state(state, &request.admission)
+        .map_err(map_admission_refusal)?;
+    verify_binding(verified, request.source, &request.binding, superseded_epoch)
+}
+
+fn verify_replacement_catch_up(
+    authority: &SdkReplacementAuthority,
+    snapshots: &[Value],
+    request: &ColdReplacementRequest,
+) -> Result<VerifiedBinding, ReplacementAuthorityRefusal> {
+    // The replay guard reads the tip's epoch; an empty chain has no tip, so a
+    // caller with an accepted epoch reads an unreadable authority, and a caller
+    // without one is refused by the SDK's own empty-chain bound.
+    let superseded_epoch = admit_preflight(
+        request.source,
+        &request.binding,
+        request.admission.predecessor.as_ref(),
+        snapshots.last().unwrap_or(&Value::Null),
+    )?;
+    let verified = authority
+        .catch_up(snapshots, &request.admission)
+        .map_err(map_admission_refusal)?;
+    verify_binding(verified, request.source, &request.binding, superseded_epoch)
+}
+
+/// The binding comparison, against the verified record's own values.
+fn verify_binding(
+    verified: VerifiedReplacementAuthority,
+    source: AuthoritySource,
+    binding: &ReplacementBinding,
+    superseded_epoch: Option<u64>,
+) -> Result<VerifiedBinding, ReplacementAuthorityRefusal> {
     let verified_state = verified.state();
 
     // 4. The binding comparison, against the verified record's own values.
@@ -165,15 +314,11 @@ fn verify_replacement(
     }
 
     let claim = AcceptedReplacement::verified(
-        request.source,
+        source,
         binding,
         verified.authority_epoch(),
         verified.state_digest(),
-        request
-            .admission
-            .predecessor
-            .as_ref()
-            .map(|_predecessor| accepted_epoch),
+        superseded_epoch,
     );
     Ok(VerifiedBinding {
         claim,
