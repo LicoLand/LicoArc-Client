@@ -27,14 +27,23 @@
 //!   this request.
 //! * **the new identity** — the destination must be a distinct endpoint the
 //!   successor roster really holds, never the source identity itself, so new
-//!   endpoint keys never derive from an imported source identity.
+//!   endpoint keys never derive from an imported source identity. It must
+//!   also be genuinely new at the transition that admitted it: the SDK
+//!   restamps `admittedAuthorityEpoch` to the transition's own epoch when an
+//!   existing active endpoint's identity-state digest changes, so the
+//!   roster immediately before that transition — a chain snapshot at
+//!   `admitted - 1`, or the accepted predecessor when it is that record —
+//!   must not already hold the destination.
 //! * **the source device** — the destination must have superseded it: the
 //!   source's entry is `revoked` at the destination's own admission epoch,
-//!   decided on the verified record that recorded that transition whenever
-//!   the chain supplies it — a later snapshot may already have pruned the
-//!   retired source — and that transition must have admitted or revoked
+//!   decided on the verified record that recorded that transition — a
+//!   chain snapshot at that epoch, or the accepted predecessor when it is
+//!   that record — and that transition must have admitted or revoked
 //!   nothing else at that epoch, so the pair cannot name two different
-//!   devices.
+//!   devices. A roster view that postdates the admission is not that
+//!   evidence: the SDK permits it to drop entries the transition already
+//!   retired, so a claim whose admission record no verified record
+//!   preserves is refused rather than bound to a pruned roster.
 
 use crate::{
     AcceptedReplacement, AuthoritySource, ReplacementAuthority, ReplacementAuthorityRefusal,
@@ -211,7 +220,7 @@ fn admit_preflight(
     binding: &ReplacementBinding,
     predecessor: Option<&ReplacementPredecessor>,
     presented: &Value,
-) -> Result<Option<u64>, ReplacementAuthorityRefusal> {
+) -> Result<(), ReplacementAuthorityRefusal> {
     // 1. The caller must really hold one of the two accepted sources. Ordinary
     //    backup, relay and peer input arrives as `None` and stops here, before
     //    any store, transport or effect is named.
@@ -221,11 +230,10 @@ fn admit_preflight(
 
     // 2. Replay is decided from the caller's own accepted epoch, so a superseded
     //    roster is refused rather than re-verified into acceptance.
-    let accepted_epoch = predecessor.map(|predecessor| predecessor.epoch());
-    if let Some(accepted_epoch) = accepted_epoch {
+    if let Some(accepted_epoch) = predecessor.map(ReplacementPredecessor::epoch) {
         binding.replayed_at(accepted_epoch, read_epoch(presented)?)?;
     }
-    Ok(accepted_epoch)
+    Ok(())
 }
 
 fn verify_replacement(
@@ -233,7 +241,7 @@ fn verify_replacement(
     state: &Value,
     request: &ReplacementRequest,
 ) -> Result<VerifiedBinding, ReplacementAuthorityRefusal> {
-    let accepted_epoch = admit_preflight(
+    admit_preflight(
         request.source,
         &request.binding,
         request.admission.predecessor.as_ref(),
@@ -249,7 +257,7 @@ fn verify_replacement(
         verified,
         request.source,
         &request.binding,
-        accepted_epoch,
+        request.admission.predecessor.as_ref(),
         std::slice::from_ref(state),
     )
 }
@@ -259,7 +267,7 @@ fn verify_replacement_cold(
     state: &Value,
     request: &ColdReplacementRequest,
 ) -> Result<VerifiedBinding, ReplacementAuthorityRefusal> {
-    let accepted_epoch = admit_preflight(
+    admit_preflight(
         request.source,
         &request.binding,
         request.admission.predecessor.as_ref(),
@@ -272,7 +280,7 @@ fn verify_replacement_cold(
         verified,
         request.source,
         &request.binding,
-        accepted_epoch,
+        request.admission.predecessor.as_ref(),
         std::slice::from_ref(state),
     )
 }
@@ -285,7 +293,7 @@ fn verify_replacement_catch_up(
     // The replay guard reads the tip's epoch; an empty chain has no tip, so a
     // caller with an accepted epoch reads an unreadable authority, and a caller
     // without one is refused by the SDK's own empty-chain bound.
-    let accepted_epoch = admit_preflight(
+    admit_preflight(
         request.source,
         &request.binding,
         request.admission.predecessor.as_ref(),
@@ -298,24 +306,25 @@ fn verify_replacement_catch_up(
         verified,
         request.source,
         &request.binding,
-        accepted_epoch,
+        request.admission.predecessor.as_ref(),
         snapshots,
     )
 }
 
 /// The binding comparison, against the verified record's own values.
 ///
-/// `accepted_epoch` is the epoch the caller already accepted, if any: the
+/// `predecessor` is the authority the caller already accepted, if any: the
 /// verified span is `(accepted_epoch, tip_epoch]`, and the claimed change must
 /// have been made inside it. `records` is every verified authority record the
 /// path holds — one presented state, or the whole catch-up chain — and the
-/// source-destination pairing is decided on whichever of them recorded the
-/// transition that admitted the destination.
+/// source-destination pairing is decided on whichever verified record
+/// recorded the transition that admitted the destination, with the roster
+/// immediately before it confirming the destination was genuinely new.
 fn verify_binding(
     verified: VerifiedReplacementAuthority,
     source: AuthoritySource,
     binding: &ReplacementBinding,
-    accepted_epoch: Option<u64>,
+    predecessor: Option<&ReplacementPredecessor>,
     records: &[Value],
 ) -> Result<VerifiedBinding, ReplacementAuthorityRefusal> {
     let verified_state = verified.state();
@@ -339,7 +348,9 @@ fn verify_binding(
     //    earlier transition already held authorizes nothing here: an unrelated
     //    transition can neither activate an already-active destination nor
     //    revoke an already-revoked one.
-    let floor = accepted_epoch.map_or(0, |epoch| epoch.saturating_add(1));
+    let floor = predecessor
+        .map(ReplacementPredecessor::epoch)
+        .map_or(0, |epoch| epoch.saturating_add(1));
     let changed_at = match (binding.operation(), status) {
         (ReplacementOperation::Activate, "active") => admitted,
         (ReplacementOperation::Revoke, "revoked") => {
@@ -356,17 +367,24 @@ fn verify_binding(
 
     // 6. The source device is the one the destination superseded: the
     //    transition that admitted the destination revoked it. The pairing is
-    //    decided on the verified record that recorded that transition when
-    //    `records` contains it — the SDK permits a later snapshot to drop an
-    //    already-revoked entry (`validate_roster_transition`,
-    //    `src/identity.rs`), so a tip-only lookup would refuse a real
-    //    replacement whose retired source was pruned. The earliest verified
-    //    record is the fallback: it is the least-pruned view the path holds.
+    //    decided on the verified record that recorded that transition — a
+    //    chain snapshot at the admission epoch, or the accepted predecessor
+    //    when it is that record. Any other view is not complete evidence: the
+    //    SDK permits a later snapshot to drop entries that transition already
+    //    retired (`validate_roster_transition`, `src/identity.rs`), so a
+    //    successor's roster can hide the retired source and every other device
+    //    the admission stamped. With no verified record at the admission
+    //    epoch the pair cannot be bound, and the claim is refused rather than
+    //    decided against a pruned roster.
     let pairing = records
         .iter()
         .find(|state| read_epoch(state).is_ok_and(|epoch| epoch == admitted))
-        .or_else(|| records.first())
-        .unwrap_or(verified_state);
+        .or_else(|| {
+            predecessor
+                .filter(|predecessor| predecessor.epoch() == admitted)
+                .map(ReplacementPredecessor::state)
+        })
+        .ok_or(ReplacementAuthorityRefusal::SourceDeviceMismatch)?;
     if read_device(pairing, binding.new_endpoint_identity_ref()).is_none() {
         return Err(ReplacementAuthorityRefusal::SourceDeviceMismatch);
     }
@@ -375,6 +393,38 @@ fn verify_binding(
     match read_text(source_device, "deviceStatus")? {
         "revoked" if read_epoch_field(source_device, "revokedAuthorityEpoch")? == admitted => {}
         _ => return Err(ReplacementAuthorityRefusal::SourceDeviceMismatch),
+    }
+
+    // The admission record alone cannot tell a fresh admission from a
+    //    restamp: the SDK stamps the transition's own epoch on an already
+    //    rostered endpoint whose identity-state digest changed
+    //    (`validate_roster_transition`, `src/identity.rs`), so that record
+    //    can pair a revoked source with an endpoint that was never new.
+    //    The roster immediately before the transition decides — a genuinely
+    //    new destination is absent from it. That roster is a chain snapshot
+    //    at `admitted - 1`, or the accepted predecessor when it is that
+    //    record. When the predecessor *is* the admission record its own
+    //    verified state is already the caller's anchor, and a genesis
+    //    admission (`admitted == 0`) has no roster before it; any other
+    //    claim must carry the pre-admission record among its verified
+    //    evidence or be refused.
+    let before = admitted.checked_sub(1).and_then(|prior| {
+        records
+            .iter()
+            .find(|state| read_epoch(state).is_ok_and(|epoch| epoch == prior))
+            .or_else(|| {
+                predecessor
+                    .filter(|predecessor| predecessor.epoch() == prior)
+                    .map(ReplacementPredecessor::state)
+            })
+    });
+    if let Some(before) = before {
+        if read_device(before, binding.new_endpoint_identity_ref()).is_some() {
+            return Err(ReplacementAuthorityRefusal::SourceDeviceMismatch);
+        }
+    } else if admitted != 0 && predecessor.is_none_or(|predecessor| predecessor.epoch() != admitted)
+    {
+        return Err(ReplacementAuthorityRefusal::SourceDeviceMismatch);
     }
 
     // One signed transition may admit or revoke several devices in the same

@@ -172,10 +172,11 @@ const MAX_SCHEDULABLE_WAIT: Duration = Duration::from_secs(86_400);
 /// How one reconnect wait ended.
 #[derive(Debug, Eq, PartialEq)]
 enum WaitOutcome {
-    /// The wait elapsed — or was cut short by a stop edge that already
-    /// cleared, which the loop treats like an elapsed wait either way.
+    /// The full wait elapsed on the monotonic clock.
     Waited,
-    /// A graceful stop was requested during the wait.
+    /// A graceful stop was requested during the wait, or the stop channel
+    /// closed — the same end the connected receive loop's own
+    /// `stop.changed()` branch produces.
     Stopped,
 }
 
@@ -183,21 +184,34 @@ enum WaitOutcome {
 ///
 /// A single `tokio::time::sleep` would hand the whole duration to one timer
 /// entry; splitting it keeps the full accepted range correct on platforms
-/// whose `Instant` cannot express the deadline.
-async fn paced_wait(mut remaining: Duration, stop: &mut watch::Receiver<bool>) -> WaitOutcome {
-    while !remaining.is_zero() {
+/// whose `Instant` cannot express the deadline. What remains is measured
+/// from the monotonic clock rather than counted in chunks, so a task that
+/// resumes after the clock advanced past several chunks has nothing left
+/// to sleep. A `false` stop update is not a stop request and leaves the
+/// timer running; the wait ends only when the clock says it elapsed or a
+/// real stop lands.
+async fn paced_wait(wait: Duration, stop: &mut watch::Receiver<bool>) -> WaitOutcome {
+    let start = tokio::time::Instant::now();
+    loop {
+        let remaining = wait.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return WaitOutcome::Waited;
+        }
         let chunk = remaining.min(MAX_SCHEDULABLE_WAIT);
         tokio::select! {
-            () = tokio::time::sleep(chunk) => remaining -= chunk,
-            _ = stop.changed() => {
-                if *stop.borrow() {
-                    return WaitOutcome::Stopped;
+            () = tokio::time::sleep(chunk) => {}
+            changed = stop.changed() => {
+                match changed {
+                    Ok(()) => {
+                        if *stop.borrow() {
+                            return WaitOutcome::Stopped;
+                        }
+                    }
+                    Err(_) => return WaitOutcome::Stopped,
                 }
-                return WaitOutcome::Waited;
             }
         }
     }
-    WaitOutcome::Waited
 }
 
 /// The unjittered cadence [`receive_loop`] walks after each lost attempt:
@@ -354,6 +368,89 @@ mod tests {
         assert_eq!(
             waiter.await.expect("the wait task completes"),
             WaitOutcome::Stopped
+        );
+    }
+
+    /// A `false` stop update is not a stop request: the timer keeps
+    /// running, and a real stop during the same wait still ends it. A wait
+    /// that ended on the `false` edge would skip the backoff entirely.
+    #[tokio::test(start_paused = true)]
+    async fn a_false_stop_update_leaves_the_wait_running() {
+        let (sender, mut stop) = watch::channel(false);
+        let waiter =
+            tokio::spawn(async move { paced_wait(Duration::from_millis(50), &mut stop).await });
+        tokio::task::yield_now().await;
+
+        sender.send(false).expect("the stop channel is open");
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a false update must not end the wait early"
+        );
+
+        sender.send(true).expect("the stop channel is open");
+        assert_eq!(
+            waiter.await.expect("the wait task completes"),
+            WaitOutcome::Stopped,
+            "a real stop after the false edge still ends the wait"
+        );
+    }
+
+    /// After a `false` update the timer still expires on its own — the
+    /// wait ends when the clock says it elapsed, not when the channel
+    /// twitched.
+    #[tokio::test(start_paused = true)]
+    async fn the_timer_still_expires_after_a_false_update() {
+        let (sender, mut stop) = watch::channel(false);
+        let waiter =
+            tokio::spawn(async move { paced_wait(Duration::from_millis(50), &mut stop).await });
+        tokio::task::yield_now().await;
+
+        sender.send(false).expect("the stop channel is open");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        assert_eq!(
+            waiter.await.expect("the wait task completes"),
+            WaitOutcome::Waited
+        );
+    }
+
+    /// Dropping the last sender closes the channel. The connected receive
+    /// loop's `stop.changed()` branch ends the loop on that same event, so
+    /// the wait ends the same way — as a stop — instead of falling through
+    /// to a `false` read that would skip every retry delay.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_stop_channel_ends_the_wait_as_stopped() {
+        let (sender, mut stop) = watch::channel(false);
+        let waiter =
+            tokio::spawn(async move { paced_wait(Duration::from_secs(3_600), &mut stop).await });
+        tokio::task::yield_now().await;
+        drop(sender);
+        assert_eq!(
+            waiter.await.expect("the wait task completes"),
+            WaitOutcome::Stopped
+        );
+    }
+
+    /// The wait is measured on the monotonic clock, not counted in chunks:
+    /// a task suspended while the clock advances past several chunks finds
+    /// nothing left to sleep when it resumes. Chunk arithmetic alone would
+    /// have it sleep the unslept remainder anyway.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_advance_spanning_chunks_ends_the_wait() {
+        let (_sender, mut stop) = watch::channel(false);
+        // 36 hours: two schedulable chunks, the second partial.
+        let wait = MAX_SCHEDULABLE_WAIT + MAX_SCHEDULABLE_WAIT / 2;
+        let waiter = tokio::spawn(async move { paced_wait(wait, &mut stop).await });
+        tokio::task::yield_now().await;
+
+        // The task sleeps the first chunk; the clock advances 48 hours
+        // before it resumes — past the whole wait.
+        tokio::time::advance(MAX_SCHEDULABLE_WAIT * 2).await;
+        assert_eq!(
+            waiter.await.expect("the wait task completes"),
+            WaitOutcome::Waited,
+            "elapsed monotonic time, not scheduled chunks, decides what remains"
         );
     }
 }
