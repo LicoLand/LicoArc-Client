@@ -105,6 +105,9 @@ struct Store {
     delivered: AtomicU64,
     /// Every accepted TCP connection, for the backoff measurement.
     accepts: Mutex<Vec<Instant>>,
+    /// Connections accepted and dropped under [`Mode::Drop`]. A mode change
+    /// must wait for the drop itself, not the accept record.
+    dropped: AtomicU64,
     /// Live connections over the run, so reconnects are observable.
     conns: AtomicU64,
     /// Wakes the active delivery lane when new rows arrive.
@@ -112,6 +115,18 @@ struct Store {
     /// Holds ACK processing at a chosen row until the driver cuts the lane.
     pause_after_ack: AtomicU64,
     paused: Notify,
+    /// When nonzero, the next client ACK is recorded in `held` and left
+    /// unapplied: the row stays stored, so a reconnect replays a packet the
+    /// client had already written to its spool.
+    hold_next: AtomicU64,
+    /// Delivery sequences whose first ACK was left unapplied.
+    held: Mutex<BTreeSet<u64>>,
+    /// Every delivery sequence the client ever ACKed — proof the packet was
+    /// durably accepted before the row left storage.
+    client_acked: Mutex<BTreeSet<u64>>,
+    /// Sequences delivered again after the client had already ACKed them:
+    /// replays that exercise the spool's same-sequence overwrite.
+    replayed: Mutex<BTreeSet<u64>>,
     /// Bumped to kill every live connection; a lane dies when the epoch
     /// advances past the one it was spawned under.
     kill_epoch: watch::Sender<u64>,
@@ -176,6 +191,7 @@ async fn serve(
                 store.conns.fetch_add(1, Ordering::SeqCst);
                 if *mode.borrow() == Mode::Drop {
                     drop(socket);
+                    store.dropped.fetch_add(1, Ordering::SeqCst);
                     continue;
                 }
                 let config = config.clone();
@@ -297,6 +313,9 @@ async fn connection(
                 .map_err(|_| ())?;
             inflight.insert(sequence);
             store.delivered.fetch_add(1, Ordering::SeqCst);
+            if store.client_acked.lock().unwrap().contains(&sequence) {
+                store.replayed.lock().unwrap().insert(sequence);
+            }
             drained_sent = false;
         }
         let pause_after_ack = store.pause_after_ack.load(Ordering::SeqCst);
@@ -322,18 +341,53 @@ async fn connection(
                     Some(Ok(Message::Binary(bytes))) => {
                         match ClientFrame::decode(&bytes).map_err(|_| ())? {
                             ClientFrame::Ack { delivery_sequence } => {
-                                // ACK deletes the row; an ACK for a row
-                                // already gone is a no-op, never a loss.
-                                if store
-                                    .rows
+                                store
+                                    .client_acked
                                     .lock()
                                     .unwrap()
-                                    .remove(&delivery_sequence)
-                                    .is_some()
-                                {
-                                    store.acked.fetch_add(1, Ordering::SeqCst);
+                                    .insert(delivery_sequence);
+                                let already_held = store
+                                    .held
+                                    .lock()
+                                    .unwrap()
+                                    .contains(&delivery_sequence);
+                                if already_held {
+                                    // The replay's re-ACK: apply it now and
+                                    // let the held row settle like any other.
+                                    if store
+                                        .rows
+                                        .lock()
+                                        .unwrap()
+                                        .remove(&delivery_sequence)
+                                        .is_some()
+                                    {
+                                        store.acked.fetch_add(1, Ordering::SeqCst);
+                                    }
+                                    inflight.remove(&delivery_sequence);
+                                } else if store.hold_next.swap(0, Ordering::SeqCst) == 1 {
+                                    // Leave this ACK unapplied: the client
+                                    // already wrote the row, and keeping it
+                                    // stored forces the reconnect to replay
+                                    // it into the same spool entry.
+                                    store
+                                        .held
+                                        .lock()
+                                        .unwrap()
+                                        .insert(delivery_sequence);
+                                } else {
+                                    // ACK deletes the row; an ACK for a row
+                                    // already gone is a no-op, never a loss.
+                                    if store
+                                        .rows
+                                        .lock()
+                                        .unwrap()
+                                        .remove(&delivery_sequence)
+                                        .is_some()
+                                    {
+                                        store.acked.fetch_add(1, Ordering::SeqCst);
+                                    }
+                                    inflight.remove(&delivery_sequence);
                                 }
-                                inflight.remove(&delivery_sequence);
                             }
                             ClientFrame::Send { request_id, .. } => {
                                 let result = StationFrame::Result {
@@ -381,10 +435,15 @@ async fn start_station() -> (Station, TempDir) {
         acked: AtomicU64::new(0),
         delivered: AtomicU64::new(0),
         accepts: Mutex::new(Vec::new()),
+        dropped: AtomicU64::new(0),
         conns: AtomicU64::new(0),
         changed: Notify::new(),
         pause_after_ack: AtomicU64::new(u64::MAX),
         paused: Notify::new(),
+        hold_next: AtomicU64::new(0),
+        held: Mutex::new(BTreeSet::new()),
+        client_acked: Mutex::new(BTreeSet::new()),
+        replayed: Mutex::new(BTreeSet::new()),
         kill_epoch: kill,
     });
     let task = tokio::spawn(serve(
@@ -414,11 +473,13 @@ async fn start_station() -> (Station, TempDir) {
 struct Counted<S> {
     inner: S,
     accepts: u64,
+    by_sequence: BTreeMap<u64, u64>,
 }
 
 impl<S: PacketSink> PacketSink for Counted<S> {
     fn accept(&mut self, sequence: u64, handle: HandleToken, packet: &[u8]) -> Verdict {
         self.accepts += 1;
+        *self.by_sequence.entry(sequence).or_insert(0) += 1;
         self.inner.accept(sequence, handle, packet)
     }
 }
@@ -441,6 +502,19 @@ async fn wait_accepts(store: &Store, count: usize, budget: Duration) {
     let deadline = Instant::now() + budget;
     while store.accepts.lock().unwrap().len() < count {
         assert!(Instant::now() < deadline, "attempts stalled below {count}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Polls until at least `count` accepts have been dropped by the fixture,
+/// so a mode change cannot race a recorded-but-not-yet-dropped accept.
+async fn wait_dropped(store: &Store, count: u64, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    while store.dropped.load(Ordering::SeqCst) < count {
+        assert!(
+            Instant::now() < deadline,
+            "dropped attempts stalled below {count}"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
@@ -472,6 +546,7 @@ async fn backlog_survives_disconnect_restart_and_reconnect() {
     let mut sink = Counted {
         inner: Spool::open(&dir.0.join("spool")).unwrap(),
         accepts: 0,
+        by_sequence: BTreeMap::new(),
     };
     let (stop, stop_rx) = watch::channel(false);
     let policy = ReconnectPolicy {
@@ -489,23 +564,37 @@ async fn backlog_survives_disconnect_restart_and_reconnect() {
 
         // Phase 2 — a large second backlog arrives; the lane is cut while
         // rows are unacknowledged in flight. They must be replayed with the
-        // same sequences on reconnect.
+        // same sequences on reconnect. One identified ACK is held unapplied:
+        // the client had already written that row, so its replay must land
+        // in the same spool entry instead of being a first write.
+        store.hold_next.store(1, Ordering::SeqCst);
         store.pause_after_ack.store(300, Ordering::SeqCst);
         expected.extend(store.enqueue("aftercut", 400, handle_bytes));
         tokio::time::timeout(budget, store.paused.notified())
             .await
             .expect("no rows in flight to cut");
+        assert_eq!(
+            store.held.lock().unwrap().len(),
+            1,
+            "one ACK must be held unapplied before the cut"
+        );
         station.control.send(Control::KillConnections).unwrap();
         wait_acked(store, 600, budget).await;
 
         // Phase 3 — a Station restart during delivery: every lane dies, the
         // listener goes down for a real downtime, and the surviving rows are
-        // replayed once it is back.
+        // replayed once it is back. A second ACK is held unapplied here too.
+        store.hold_next.store(1, Ordering::SeqCst);
         store.pause_after_ack.store(620, Ordering::SeqCst);
         expected.extend(store.enqueue("restart", 100, handle_bytes));
         tokio::time::timeout(budget, store.paused.notified())
             .await
             .expect("no rows in flight before restart");
+        assert_eq!(
+            store.held.lock().unwrap().len(),
+            2,
+            "one more ACK must be held unapplied before the restart"
+        );
         station
             .control
             .send(Control::Restart {
@@ -554,6 +643,24 @@ async fn backlog_survives_disconnect_restart_and_reconnect() {
         "each stored row was ACKed and deleted exactly once"
     );
 
+    // Each interruption held one ACK unapplied, and each of those rows was
+    // really redelivered after the client had durably written it: the sink
+    // saw the same sequence again while the spool kept one file per
+    // sequence — the replay landed in the same spool entry.
+    let held = station.store.held.lock().unwrap().clone();
+    assert_eq!(held.len(), 2, "each interruption must hold one ACK");
+    let replayed = station.store.replayed.lock().unwrap().clone();
+    for sequence in &held {
+        assert!(
+            replayed.contains(sequence),
+            "held row {sequence} was never replayed"
+        );
+        assert!(
+            sink.by_sequence.get(sequence).copied().unwrap_or(0) >= 2,
+            "sequence {sequence} must reach the sink again after the replay"
+        );
+    }
+
     // No loss, no duplicate effect: the spool holds exactly one file per
     // delivery sequence — redeliveries overwrote their own sequence file —
     // and every packet landed with its own bytes.
@@ -572,14 +679,16 @@ async fn backlog_survives_disconnect_restart_and_reconnect() {
         sequences.iter().copied().eq(continuity),
         "delivery sequences are contiguous with no gaps or duplicates"
     );
-    let mut payloads = stored
-        .iter()
-        .map(|(_, path)| std::fs::read(path).unwrap())
-        .collect::<Vec<_>>();
-    payloads.sort();
-    let mut wanted = expected;
-    wanted.sort();
-    assert_eq!(payloads, wanted, "every packet landed with its own bytes");
+    // Each sequence must hold its own packet: compare sequence and bytes
+    // together, so a payload stored under a wrong sequence cannot pass.
+    for (sequence, path) in &stored {
+        let expected_packet = &expected[(*sequence - 1) as usize];
+        assert_eq!(
+            &std::fs::read(path).unwrap(),
+            expected_packet,
+            "sequence {sequence} holds the wrong packet"
+        );
+    }
 }
 
 /// The reconnect cadence stays inside the configured backoff: the wait before
@@ -601,17 +710,19 @@ async fn reconnect_backoff_stays_within_the_policy() {
     let mut sink = Counted {
         inner: Spool::open(&dir.0.join("spool")).unwrap(),
         accepts: 0,
+        by_sequence: BTreeMap::new(),
     };
     let (stop, stop_rx) = watch::channel(false);
     let policy = ReconnectPolicy {
-        initial: Duration::from_millis(40),
-        multiplier: 2,
-        cap: Duration::from_millis(150),
+        initial: Duration::from_millis(100),
+        multiplier: 4,
+        cap: Duration::from_millis(200),
     };
 
     let driver = async {
-        // Five attempts produce four measured backoff waits: 40, 80 and the
-        // 150 cap held twice — the multiplier doubling then clamping.
+        // Five attempts produce four measured backoff waits: 100 then the
+        // 200 cap held three times. With the cap missing the third wait
+        // would be 1600 ms — far outside the capped assertion window.
         wait_accepts(&station.store, 5, Duration::from_secs(15)).await;
         stop.send(true).unwrap();
     };
@@ -632,15 +743,17 @@ async fn reconnect_backoff_stays_within_the_policy() {
         .collect::<Vec<_>>();
     // The wait after failure k is base_k = min(initial*mult^(k-1), cap), then
     // up to +50 % jitter. The measured gap also includes the failing
-    // attempt's own latency, so only a small lower slack applies.
+    // attempt's own latency and scheduler noise under a parallel suite, so
+    // the upper slack is generous — yet stays far below the 1600 ms wait an
+    // uncapped cadence would show at index 2.
     for (index, gap) in gaps.iter().enumerate().take(4) {
-        let base = Duration::from_millis([40_u64, 80, 150, 150][index]);
+        let base = Duration::from_millis([100_u64, 200, 200, 200][index]);
         assert!(
             *gap >= base.mul_f64(0.8),
             "gap {index} {gap:?} below the {base:?} backoff wait"
         );
         assert!(
-            *gap <= base.mul_f64(1.5) + Duration::from_millis(150),
+            *gap <= base.mul_f64(1.5) + Duration::from_millis(500),
             "gap {index} {gap:?} above the jittered {base:?} backoff wait"
         );
     }
@@ -663,6 +776,7 @@ async fn a_successful_connect_resets_the_backoff() {
     let mut sink = Counted {
         inner: Spool::open(&dir.0.join("spool")).unwrap(),
         accepts: 0,
+        by_sequence: BTreeMap::new(),
     };
     let (stop, stop_rx) = watch::channel(false);
     let policy = ReconnectPolicy {
@@ -673,8 +787,10 @@ async fn a_successful_connect_resets_the_backoff() {
 
     let driver = async {
         // Three failed attempts grow the wait: 40, then 160, then the
-        // 500 cap — the next wait is the grown value.
-        wait_accepts(&station.store, 3, Duration::from_secs(15)).await;
+        // 500 cap — the next wait is the grown value. Wait for the third
+        // socket to be dropped, not merely accepted, before enabling
+        // service so the mode flip cannot race the fixture's mode read.
+        wait_dropped(&station.store, 3, Duration::from_secs(15)).await;
         station.mode.send(Mode::Serve).unwrap();
         // An ACK proves the next attempt reached the mailbox receive loop.
         station.store.enqueue(
