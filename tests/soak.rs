@@ -543,6 +543,9 @@ async fn backlog_survives_disconnect_restart_and_reconnect() {
     )
     .unwrap();
     let roots = vec![station.ca_pem.clone()];
+    // The scenario reads spool entries through a second handle: the sink's
+    // own `Spool` is borrowed by the receive loop for the whole run.
+    let spool = Spool::open(&dir.0.join("spool")).unwrap();
     let mut sink = Counted {
         inner: Spool::open(&dir.0.join("spool")).unwrap(),
         accepts: 0,
@@ -555,6 +558,9 @@ async fn backlog_survives_disconnect_restart_and_reconnect() {
         cap: Duration::from_millis(200),
     };
     let budget = Duration::from_secs(30);
+    // The spool path each held row occupied before its interruption —
+    // proof the replay overwrote that entry rather than writing first.
+    let mut held_before: BTreeMap<u64, PathBuf> = BTreeMap::new();
 
     let scenario = async {
         let store = &station.store;
@@ -578,6 +584,19 @@ async fn backlog_survives_disconnect_restart_and_reconnect() {
             1,
             "one ACK must be held unapplied before the cut"
         );
+        // The held row must already sit in its final spool entry: the
+        // client wrote it before sending the ACK the Station held, so the
+        // coming replay has to overwrite that same entry — a first write
+        // at replay time would prove nothing about deduplication.
+        for sequence in store.held.lock().unwrap().iter() {
+            let path = spool.path(handle, *sequence);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                expected[(*sequence - 1) as usize],
+                "held row {sequence} was not in its spool entry before the cut"
+            );
+            held_before.insert(*sequence, path);
+        }
         station.control.send(Control::KillConnections).unwrap();
         wait_acked(store, 600, budget).await;
 
@@ -595,6 +614,15 @@ async fn backlog_survives_disconnect_restart_and_reconnect() {
             2,
             "one more ACK must be held unapplied before the restart"
         );
+        for sequence in store.held.lock().unwrap().iter() {
+            let path = spool.path(handle, *sequence);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                expected[(*sequence - 1) as usize],
+                "held row {sequence} was not in its spool entry before the restart"
+            );
+            held_before.insert(*sequence, path);
+        }
         station
             .control
             .send(Control::Restart {
@@ -687,6 +715,25 @@ async fn backlog_survives_disconnect_restart_and_reconnect() {
             &std::fs::read(path).unwrap(),
             expected_packet,
             "sequence {sequence} holds the wrong packet"
+        );
+    }
+
+    // Each held row kept its original entry: exactly one file remains at
+    // the path the pre-interruption check observed — the replay overwrote
+    // the entry the client's first delivery created.
+    for (sequence, path) in &held_before {
+        let entries = stored
+            .iter()
+            .filter(|(stored_sequence, _)| stored_sequence == sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.len(),
+            1,
+            "held row {sequence} must leave exactly one spool entry"
+        );
+        assert_eq!(
+            &entries[0].1, path,
+            "held row {sequence} moved away from its original spool entry"
         );
     }
 }

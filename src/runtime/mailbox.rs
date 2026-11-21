@@ -80,15 +80,7 @@ pub async fn receive_loop<S: PacketSink>(
     mut stop: watch::Receiver<bool>,
     policy: ReconnectPolicy,
 ) -> LoopExit {
-    let cap_ms = u64::try_from(policy.cap.as_millis())
-        .unwrap_or(u64::MAX)
-        .max(1);
-    let multiplier = u64::from(policy.multiplier.max(1));
-    let initial_ms = u64::try_from(policy.initial.as_millis())
-        .unwrap_or(u64::MAX)
-        .min(cap_ms)
-        .max(1);
-    let mut backoff_ms = initial_ms;
+    let mut backoff = Backoff::new(policy);
     loop {
         if *stop.borrow() {
             return LoopExit::Stopped;
@@ -104,7 +96,7 @@ pub async fn receive_loop<S: PacketSink>(
             }
             Err(_) => {}
             Ok(mut client) => {
-                backoff_ms = initial_ms;
+                backoff.reset();
                 match drive(&mut client, sink, &mut stop).await {
                     DriveOutcome::Stopped => return LoopExit::Stopped,
                     DriveOutcome::Fatal(error) => return LoopExit::Failed(error),
@@ -112,8 +104,7 @@ pub async fn receive_loop<S: PacketSink>(
                 }
             }
         }
-        let wait = jittered(backoff_ms);
-        backoff_ms = backoff_ms.saturating_mul(multiplier).min(cap_ms);
+        let wait = jittered(backoff.wait_ms());
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             _ = stop.changed() => {
@@ -173,9 +164,100 @@ async fn drive<S: PacketSink>(
     }
 }
 
+/// The unjittered cadence [`receive_loop`] walks after each lost attempt:
+/// `initial`, grown by `multiplier` per loss, never beyond `cap`, and back
+/// to `initial` after a successful connect.
+struct Backoff {
+    initial_ms: u64,
+    next_ms: u64,
+    multiplier: u64,
+    cap_ms: u64,
+}
+
+impl Backoff {
+    fn new(policy: ReconnectPolicy) -> Self {
+        let cap_ms = u64::try_from(policy.cap.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let initial_ms = u64::try_from(policy.initial.as_millis())
+            .unwrap_or(u64::MAX)
+            .min(cap_ms)
+            .max(1);
+        Self {
+            initial_ms,
+            next_ms: initial_ms,
+            multiplier: u64::from(policy.multiplier.max(1)),
+            cap_ms,
+        }
+    }
+
+    /// The unjittered wait after this loss; the next loss waits longer.
+    fn wait_ms(&mut self) -> u64 {
+        let wait = self.next_ms;
+        self.next_ms = self
+            .next_ms
+            .saturating_mul(self.multiplier)
+            .min(self.cap_ms);
+        wait
+    }
+
+    /// A successful connect restarts the cadence at `initial`.
+    fn reset(&mut self) {
+        self.next_ms = self.initial_ms;
+    }
+}
+
 fn jittered(base_ms: u64) -> Duration {
     let mut extra = [0_u8; 8];
     getrandom::fill(&mut extra).unwrap_or_default();
     let jitter = u64::from_be_bytes(extra) % (base_ms / 2 + 1);
     Duration::from_millis(base_ms + jitter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Backoff, ReconnectPolicy, jittered};
+    use std::time::Duration;
+
+    /// The loop must select exactly `initial`, then `initial * multiplier^k`
+    /// clamped at `cap` — never beyond it. A cadence that let the cap slip
+    /// (e.g. one that settled at 2×cap) would select different delays here
+    /// even where coarse socket-gap windows could not tell it apart.
+    #[test]
+    fn the_progression_reaches_the_cap_and_holds_it() {
+        let mut backoff = Backoff::new(ReconnectPolicy {
+            initial: Duration::from_millis(100),
+            multiplier: 4,
+            cap: Duration::from_millis(200),
+        });
+        let waits = (0..6).map(|_| backoff.wait_ms()).collect::<Vec<_>>();
+        assert_eq!(waits, [100, 200, 200, 200, 200, 200]);
+    }
+
+    /// A successful connect restarts the cadence at `initial`, not at the
+    /// grown value the losses had reached.
+    #[test]
+    fn a_successful_connect_resets_the_progression() {
+        let mut backoff = Backoff::new(ReconnectPolicy {
+            initial: Duration::from_millis(40),
+            multiplier: 4,
+            cap: Duration::from_millis(500),
+        });
+        assert_eq!(backoff.wait_ms(), 40);
+        assert_eq!(backoff.wait_ms(), 160);
+        assert_eq!(backoff.wait_ms(), 500);
+        backoff.reset();
+        assert_eq!(backoff.wait_ms(), 40);
+        assert_eq!(backoff.wait_ms(), 160);
+    }
+
+    /// Jitter can only stretch the selected wait by up to +50 %.
+    #[test]
+    fn jitter_stays_within_half_the_base() {
+        for _ in 0..256 {
+            let wait = jittered(200);
+            assert!(wait >= Duration::from_millis(200));
+            assert!(wait <= Duration::from_millis(300));
+        }
+    }
 }
