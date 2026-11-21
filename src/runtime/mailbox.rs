@@ -105,13 +105,8 @@ pub async fn receive_loop<S: PacketSink>(
             }
         }
         let wait = jittered(backoff.wait_ms());
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = stop.changed() => {
-                if *stop.borrow() {
-                    return LoopExit::Stopped;
-                }
-            }
+        if let WaitOutcome::Stopped = paced_wait(wait, &mut stop).await {
+            return LoopExit::Stopped;
         }
     }
 }
@@ -162,6 +157,47 @@ async fn drive<S: PacketSink>(
             },
         }
     }
+}
+
+/// The longest single timer [`paced_wait`] asks the platform to hold.
+///
+/// The CLI accepts the full positive u64 millisecond range, so a selected
+/// wait can exceed any timer's `Instant` range: Tokio substitutes a nearer
+/// deadline when the addition overflows, which would silently shorten an
+/// accepted delay. One day is schedulable everywhere, so the wait is slept
+/// in chunks of at most this size — and the stop signal is answered at each
+/// boundary instead of after the whole delay.
+const MAX_SCHEDULABLE_WAIT: Duration = Duration::from_secs(86_400);
+
+/// How one reconnect wait ended.
+#[derive(Debug, Eq, PartialEq)]
+enum WaitOutcome {
+    /// The wait elapsed — or was cut short by a stop edge that already
+    /// cleared, which the loop treats like an elapsed wait either way.
+    Waited,
+    /// A graceful stop was requested during the wait.
+    Stopped,
+}
+
+/// Waits `wait` in chunks every platform timer can hold.
+///
+/// A single `tokio::time::sleep` would hand the whole duration to one timer
+/// entry; splitting it keeps the full accepted range correct on platforms
+/// whose `Instant` cannot express the deadline.
+async fn paced_wait(mut remaining: Duration, stop: &mut watch::Receiver<bool>) -> WaitOutcome {
+    while !remaining.is_zero() {
+        let chunk = remaining.min(MAX_SCHEDULABLE_WAIT);
+        tokio::select! {
+            () = tokio::time::sleep(chunk) => remaining -= chunk,
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    return WaitOutcome::Stopped;
+                }
+                return WaitOutcome::Waited;
+            }
+        }
+    }
+    WaitOutcome::Waited
 }
 
 /// The unjittered cadence [`receive_loop`] walks after each lost attempt:
@@ -219,8 +255,11 @@ fn jittered(base_ms: u64) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{Backoff, ReconnectPolicy, jittered};
+    use super::{
+        Backoff, MAX_SCHEDULABLE_WAIT, ReconnectPolicy, WaitOutcome, jittered, paced_wait,
+    };
     use std::time::Duration;
+    use tokio::sync::watch;
 
     /// The loop must select exactly `initial`, then `initial * multiplier^k`
     /// clamped at `cap` — never beyond it. A cadence that let the cap slip
@@ -275,5 +314,46 @@ mod tests {
             assert!(wait >= base);
             assert!(wait <= base + Duration::from_millis(u64::MAX / 2));
         }
+    }
+
+    /// A wait inside any platform timer's range still elapses on its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_schedulable_wait_elapses() {
+        let (_sender, mut stop) = watch::channel(false);
+        let wait =
+            tokio::spawn(async move { paced_wait(Duration::from_millis(50), &mut stop).await });
+        tokio::time::advance(Duration::from_millis(60)).await;
+        assert_eq!(
+            wait.await.expect("the wait task completes"),
+            WaitOutcome::Waited
+        );
+    }
+
+    /// The largest wait the accepted range can select is past every platform
+    /// timer's `Instant` range — where a single `sleep` would be silently
+    /// shortened to a nearer deadline. Chunked scheduling proves the whole
+    /// wait is held: several full chunks leave it pending, and `stop` still
+    /// ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_past_the_timers_range_stays_pending_and_stops() {
+        let (sender, mut stop) = watch::channel(false);
+        let wait = Duration::from_millis(u64::MAX) + Duration::from_millis(u64::MAX / 2);
+        let waiter = tokio::spawn(async move { paced_wait(wait, &mut stop).await });
+        tokio::task::yield_now().await;
+
+        for _ in 0..4 {
+            tokio::time::advance(MAX_SCHEDULABLE_WAIT).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "a u64::MAX-scale wait must not be shortened to a nearer deadline"
+        );
+
+        sender.send(true).expect("the stop channel is open");
+        assert_eq!(
+            waiter.await.expect("the wait task completes"),
+            WaitOutcome::Stopped
+        );
     }
 }
