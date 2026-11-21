@@ -136,7 +136,7 @@ impl ReplacementPredecessor {
     /// [`VerifiedReplacementAuthority::predecessor`] carries it over —
     /// supplies it through [`Self::with_fresh_admissions`] instead.
     #[must_use]
-    pub fn new(authority: AcceptedUserAuthority) -> Self {
+    pub const fn new(authority: AcceptedUserAuthority) -> Self {
         Self {
             authority,
             fresh_admissions: BTreeSet::new(),
@@ -502,12 +502,13 @@ impl SdkReplacementAuthority {
             &endpoints,
         )
         .map(|authority| VerifiedReplacementAuthority {
-            fresh_admissions: fresh_admissions(
-                &authority.state,
+            fresh_admissions: retained_fresh_admissions(
+                &authority,
                 admission
                     .predecessor
                     .as_ref()
                     .map(ReplacementPredecessor::state),
+                admission.predecessor.as_ref(),
             ),
             authority,
         })
@@ -546,12 +547,13 @@ impl SdkReplacementAuthority {
             &endpoints,
         )
         .map(|authority| VerifiedReplacementAuthority {
-            fresh_admissions: fresh_admissions(
-                &authority.state,
+            fresh_admissions: retained_fresh_admissions(
+                &authority,
                 admission
                     .predecessor
                     .as_ref()
                     .map(ReplacementPredecessor::state),
+                admission.predecessor.as_ref(),
             ),
             authority,
         })
@@ -604,12 +606,37 @@ impl SdkReplacementAuthority {
                         .map(ReplacementPredecessor::state)
                 });
             VerifiedReplacementAuthority {
-                fresh_admissions: fresh_admissions(&authority.state, prior),
+                fresh_admissions: retained_fresh_admissions(
+                    &authority,
+                    prior,
+                    admission.predecessor.as_ref(),
+                ),
                 authority,
             }
         })
         .map_err(|_cause: crate::Error| ReplacementAdmissionRefusal::VerificationRefused)
     }
+}
+
+/// The fresh-admission set one admission result retains.
+///
+/// `prior` is the roster the returned record's own transition was validated
+/// against and `predecessor` the caller's accepted record. When the SDK
+/// returns the already-accepted record unchanged — an authenticated session
+/// re-presenting it is admitted as itself — the roster diff against itself
+/// is empty, but the proof belongs to the record, not to this call: the
+/// predecessor's retained set is carried forward rather than recomputed.
+fn retained_fresh_admissions(
+    authority: &AcceptedUserAuthority,
+    prior: Option<&Value>,
+    predecessor: Option<&ReplacementPredecessor>,
+) -> BTreeSet<String> {
+    if let Some(predecessor) = predecessor
+        && predecessor.state_digest() == authority.state_digest
+    {
+        return predecessor.fresh_admissions.clone();
+    }
+    fresh_admissions(&authority.state, prior)
 }
 
 /// The endpoint references `record`'s roster holds that `prior`'s does not —
@@ -2458,5 +2485,106 @@ mod tests {
             Some(ReplacementAuthorityRefusal::SourceDeviceMismatch),
             "the bare admission record carries no fresh-admission proof"
         );
+    }
+
+    /// An authenticated session that presents the already-accepted record is
+    /// re-admitted by the SDK with that record unchanged. The retained
+    /// authority must carry the fresh-admission proof the first acceptance
+    /// computed forward — diffing the returned roster against the identical
+    /// predecessor roster yields an empty set, and a later revocation claim
+    /// whose predecessor is that record has no other evidence the destination
+    /// was new.
+    #[test]
+    #[ignore = "requires LICOARC_AUTHORITY_BUNDLE and real ml-dsa-65 signing"]
+    fn a_re_admitted_record_keeps_the_fresh_admission_proof() {
+        let provider = RustCryptoProvider;
+        let fixture = fixture(&provider);
+        let (replaced, new_keys) = device_replacement_transition(&provider, &fixture);
+        let subject = hex(&fixture.accepted.user_identity_ref);
+        let source = hex(&fixture.endpoint_identity_ref);
+        let destination = new_keys.endpoint_identity_ref.clone();
+        let new_ref = super::decode_hex_32(&destination).expect("hex destination ref");
+        let bytes = authority_bytes();
+        let line = crate::AuthorityInput::new(&bytes)
+            .admit()
+            .expect("the fixed Candidate is admitted");
+        let adapter = SdkReplacementAuthority::with_admitted_line(line);
+
+        // Epoch 1 admits the destination; the acceptance retains the proof.
+        let mut endpoints = fixture.keys.clone();
+        endpoints.push(new_keys);
+        let accepted = adapter
+            .admit_state(
+                &replaced,
+                &ColdAdmission {
+                    predecessor: Some(ReplacementPredecessor::new(fixture.accepted.clone())),
+                    endpoints: endpoints.clone(),
+                },
+            )
+            .expect("the replacement admits cold");
+        assert!(
+            accepted.fresh_admissions().contains(&destination),
+            "the destination is the endpoint the transition admitted fresh"
+        );
+
+        // An authenticated session presents the accepted record itself: the
+        // SDK returns it unchanged, so the retained authority must carry the
+        // proof forward rather than recompute an empty set. The still-active
+        // second device presents, because the transition retired the first.
+        let readmitted = adapter
+            .admit(
+                accepted.state(),
+                &ReplacementAdmission {
+                    predecessor: Some(accepted.predecessor()),
+                    session: ReplacementSession {
+                        authenticated: true,
+                        authority_state_digest: accepted.state_digest(),
+                        endpoint_identity_ref: fixture.second_endpoint_identity_ref,
+                        identity_state_digest: fixture.second_identity_state_digest,
+                    },
+                    endpoints: endpoints.clone(),
+                },
+            )
+            .expect("the accepted record is re-admitted as itself");
+        assert_eq!(readmitted.state_digest(), accepted.state_digest());
+        assert_eq!(
+            readmitted.fresh_admissions(),
+            accepted.fresh_admissions(),
+            "re-admission carries the retained proof forward"
+        );
+
+        // Epoch 2 revokes the destination. The re-admitted record is the
+        // destination's own admission record, so the carried-forward proof
+        // is the only evidence the destination was new.
+        let revoked = revocation_transition(&provider, &replaced, &new_ref);
+        let request = ColdReplacementRequest::new(
+            AuthoritySource::SavedRecoveryCredential,
+            ReplacementBinding::new(
+                &subject,
+                &source,
+                &destination,
+                ReplacementOperation::Revoke,
+            ),
+            ColdAdmission {
+                predecessor: Some(readmitted.predecessor()),
+                endpoints,
+            },
+        );
+        for (path, decision) in [
+            ("cold", admit_replacement_cold(&adapter, &revoked, &request)),
+            (
+                "catch-up",
+                admit_replacement_catch_up(&adapter, std::slice::from_ref(&revoked), &request),
+            ),
+        ] {
+            let claim = decision.accepted().unwrap_or_else(|| {
+                panic!("{path}: the re-admitted record still proves the destination was new")
+            });
+            assert_eq!(claim.operation(), ReplacementOperation::Revoke);
+            assert_eq!(claim.authority_epoch(), 2);
+            assert_eq!(claim.source_device(), source);
+            assert_eq!(claim.new_endpoint_identity_ref(), destination);
+            assert_eq!(claim.superseded_epoch(), Some(1));
+        }
     }
 }
