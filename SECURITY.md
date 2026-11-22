@@ -1,21 +1,20 @@
 # Security Policy
 
-LicoArc owns protocol and cryptographic semantics; this repository never
-repairs, extends, or reinterprets them — every protocol decision is delegated
-to the pinned `licoarc` SDK. This client keeps local `unsafe_code = "forbid"`,
-refuses plaintext transports for the mailbox carrier, stores credential,
-custody, and checkpoint material owner-only, and zeroizes secret material it
-holds in memory.
+Every protocol and cryptographic decision is delegated to the pinned `licoarc`
+crate. `licoarc-client` enforces `#![forbid(unsafe_code)]`, rejects plaintext
+transports for the mailbox carrier, writes credential, custody, and checkpoint
+files with mode `0600` on Unix, and uses zeroizing buffers for in-memory
+custody keys and mailbox credentials.
 
-The bundled file-backed custody (`FileCustody`) is a development backend, not
-a product keystore: secrets on disk are raw seed bytes protected only by file
-mode `0600`. Consumers with a real custody requirement implement the custody
-port themselves.
+The bundled `FileCustody` provider is intended for development only. It stores
+unencrypted seed material on disk. Production consumers should implement the
+custody port backed by platform secure storage.
 
-Local verification is not an independent cryptographic audit. Dependencies may
-contain internal unsafe code, and logical deletion does not claim physical
-erasure, protection from a compromised process or malicious store, hardware
-custody, or side-channel resistance.
+Local verification does not include an independent cryptographic audit.
+Dependencies may contain internal `unsafe` code. Logical deletion provides no
+guarantee of physical erasure. Hardware custody, protection from a compromised
+process or malicious store, and side-channel resistance are outside the scope
+of this library.
 
 ## Reporting a Vulnerability
 
