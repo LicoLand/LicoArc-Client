@@ -1,44 +1,39 @@
 # LicoArc-Client
 
-Standalone Lico Arc endpoint client: a Rust library plus the
-`licoarc-client` CLI. The Protocol Line, its definitions, and all
-cryptography stay with the LicoArc Rust SDK (pinned at `licoarc = "=0.2.0"`);
-secret custody, persistence, trust facts, and application effects stay
-caller-owned through [`ports`](../src/ports.rs). This crate composes them:
+Standalone Lico Arc endpoint client (`licoarc_client` Rust library and
+`licoarc-client` CLI). It layers a TLS 1.3 mailbox carrier, durable spool and
+receive loop, obligation ledger, and CLI over the pinned `licoarc = "=0.2.0"`
+protocol crate while keeping secret custody, state persistence, trust decisions,
+and application effects behind caller-owned [`ports`](../src/ports.rs).
 
-- `admission` — admits an explicitly supplied authority bundle, fail-closed;
-- `carrier` — the `licoarc.mailbox-transport.v1` Station carrier: a TLS 1.3
-  WebSocket with the `licoarc.mailbox.v1` subprotocol carrying the eight
-  deterministic-CBOR frames (CHALLENGE/READY, HELLO, SEND/RESULT,
-  DELIVER/ACK, DRAINED), admission credentials, multiplexed sends, and the
-  keepalive cadence — over the `licoarc` SDK's own codecs;
-- `runtime` — the receive loop (DELIVER → sink verdict → ACK, jittered
-  reconnect on ordinary loss, terminal stop on Superseded/Revoked), the
-  durable spool, the pending-item outbox drain, and the endpoint-session
-  sink;
-- `providers` — the CLI's own backend: `FileCustody` (atomically replaced
-  custody index, development-grade) and `MemoryState` (coupled old-or-new
-  store; durability comes from the SDK's `checkpoint`/`resume` pair);
-- `durable_obligation` — an opt-in ledger of caller-admitted delivery
-  obligations, including its serialized recovery record;
-- `cli` — the standalone command line.
+## Modules
+
+- `admission` — fail-closed admission of a supplied `licoarc` authority bundle.
+- `carrier` — `licoarc.mailbox-transport.v1` Station carrier: TLS 1.3 WebSocket
+  with the `licoarc.mailbox.v1` subprotocol carrying the eight deterministic-CBOR
+  frames (`CHALLENGE`/`READY`, `HELLO`, `SEND`/`RESULT`, `DELIVER`/`ACK`,
+  `DRAINED`), admission credentials, multiplexed sends, and keepalive.
+- `runtime` — receive loop (`DELIVER` → sink verdict → `ACK`, jittered
+  reconnect on transient loss, terminal stop on `Superseded`/`Revoked`),
+  durable spool, pending-item outbox drain, and endpoint-session sink.
+- `providers` — CLI backend implementations: `FileCustody` (atomically replaced
+  development custody index) and `MemoryState` (coupled old-or-new store with
+  SDK `checkpoint`/`resume` durability).
+- `durable_obligation` — opt-in ledger and serialized recovery record for
+  caller-admitted delivery obligations.
+- `cli` — standalone CLI binary.
 
 ## Durable obligation records
 
-LicoArc-Client owns the `ObligationLedger<Payload>` API and the
-`DurableObligationRecord<Payload>` envelope it produces. The envelope records
-admission identities, generation and delivery attempts; callers supply the
-payload type and persist the record through their own storage backend.
-Admission creates an obligation that remains owed until accepted settlement.
+`ObligationLedger<Payload>` produces `DurableObligationRecord<Payload>`
+envelopes recording admission identities, generation, and delivery attempts;
+callers supply the payload type and persist records in their own storage.
+An admitted obligation stays owed until the peer accepts delivery.
 
-The published record identifier, `DURABLE_OBLIGATION_SCHEMA`, is
-`licoarc.endpoint-obligations.v1`, namespaced to the crate that owns the
-format. That spelling is part of this library's serialized contract and is
-retained for existing records; it superseded the `licoup.*` spelling first
-published in 0.2.0, and records carrying the older tag are not read as this
-schema. Readers use `schema_matches` or `from_durable_record` to validate it
-before recovering the owed set. This is a client-local persistence format;
-LicoArc owns the protocol's wire definitions.
+The serialized schema tag `DURABLE_OBLIGATION_SCHEMA` is
+`licoarc.endpoint-obligations.v1` (superseding the `licoup.*` tag from `0.2.0`;
+records with the older tag are not read as this schema). Readers validate the
+tag with `schema_matches` or `from_durable_record` before recovering owed items.
 
 ## CLI
 

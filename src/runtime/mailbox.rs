@@ -80,15 +80,7 @@ pub async fn receive_loop<S: PacketSink>(
     mut stop: watch::Receiver<bool>,
     policy: ReconnectPolicy,
 ) -> LoopExit {
-    let cap_ms = u64::try_from(policy.cap.as_millis())
-        .unwrap_or(u64::MAX)
-        .max(1);
-    let multiplier = u64::from(policy.multiplier.max(1));
-    let initial_ms = u64::try_from(policy.initial.as_millis())
-        .unwrap_or(u64::MAX)
-        .min(cap_ms)
-        .max(1);
-    let mut backoff_ms = initial_ms;
+    let mut backoff = Backoff::new(policy);
     loop {
         if *stop.borrow() {
             return LoopExit::Stopped;
@@ -104,7 +96,7 @@ pub async fn receive_loop<S: PacketSink>(
             }
             Err(_) => {}
             Ok(mut client) => {
-                backoff_ms = initial_ms;
+                backoff.reset();
                 match drive(&mut client, sink, &mut stop).await {
                     DriveOutcome::Stopped => return LoopExit::Stopped,
                     DriveOutcome::Fatal(error) => return LoopExit::Failed(error),
@@ -112,15 +104,9 @@ pub async fn receive_loop<S: PacketSink>(
                 }
             }
         }
-        let wait = jittered(backoff_ms);
-        backoff_ms = backoff_ms.saturating_mul(multiplier).min(cap_ms);
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = stop.changed() => {
-                if *stop.borrow() {
-                    return LoopExit::Stopped;
-                }
-            }
+        let wait = jittered(backoff.wait_ms());
+        if let WaitOutcome::Stopped = paced_wait(wait, &mut stop).await {
+            return LoopExit::Stopped;
         }
     }
 }
@@ -139,7 +125,20 @@ async fn drive<S: PacketSink>(
     loop {
         let event = tokio::select! {
             event = client.next() => event,
-            _ = stop.changed() => return DriveOutcome::Stopped,
+            changed = stop.changed() => {
+                match changed {
+                    Ok(()) => {
+                        // A `false` update is not a stop request — the same
+                        // rule `paced_wait` applies during backoff. Only a
+                        // real stop or a closed channel ends the receiver.
+                        if *stop.borrow() {
+                            return DriveOutcome::Stopped;
+                        }
+                        continue;
+                    }
+                    Err(_) => return DriveOutcome::Stopped,
+                }
+            }
         };
         match event {
             Err(
@@ -173,9 +172,298 @@ async fn drive<S: PacketSink>(
     }
 }
 
+/// The longest single timer [`paced_wait`] asks the platform to hold.
+///
+/// The CLI accepts the full positive u64 millisecond range, so a selected
+/// wait can exceed any timer's `Instant` range: Tokio substitutes a nearer
+/// deadline when the addition overflows, which would silently shorten an
+/// accepted delay. One day is schedulable everywhere, so the wait is slept
+/// in chunks of at most this size — and the stop signal is answered at each
+/// boundary instead of after the whole delay.
+const MAX_SCHEDULABLE_WAIT: Duration = Duration::from_secs(86_400);
+
+/// How one reconnect wait ended.
+#[derive(Debug, Eq, PartialEq)]
+enum WaitOutcome {
+    /// The full wait elapsed on the monotonic clock.
+    Waited,
+    /// A graceful stop was requested during the wait, or the stop channel
+    /// closed — the same end the connected receive loop's own
+    /// `stop.changed()` branch produces.
+    Stopped,
+}
+
+/// Waits `wait` in chunks every platform timer can hold.
+///
+/// A single `tokio::time::sleep` would hand the whole duration to one timer
+/// entry; splitting it keeps the full accepted range correct on platforms
+/// whose `Instant` cannot express the deadline. What remains is measured
+/// from the monotonic clock rather than counted in chunks, so a task that
+/// resumes after the clock advanced past several chunks has nothing left
+/// to sleep. A `false` stop update is not a stop request and leaves the
+/// timer running; the wait ends only when the clock says it elapsed or a
+/// real stop lands.
+async fn paced_wait(wait: Duration, stop: &mut watch::Receiver<bool>) -> WaitOutcome {
+    let start = tokio::time::Instant::now();
+    loop {
+        let remaining = wait.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return WaitOutcome::Waited;
+        }
+        let chunk = remaining.min(MAX_SCHEDULABLE_WAIT);
+        tokio::select! {
+            () = tokio::time::sleep(chunk) => {}
+            changed = stop.changed() => {
+                match changed {
+                    Ok(()) => {
+                        if *stop.borrow() {
+                            return WaitOutcome::Stopped;
+                        }
+                    }
+                    Err(_) => return WaitOutcome::Stopped,
+                }
+            }
+        }
+    }
+}
+
+/// The unjittered cadence [`receive_loop`] walks after each lost attempt:
+/// `initial`, grown by `multiplier` per loss, never beyond `cap`, and back
+/// to `initial` after a successful connect.
+struct Backoff {
+    initial_ms: u64,
+    next_ms: u64,
+    multiplier: u64,
+    cap_ms: u64,
+}
+
+impl Backoff {
+    fn new(policy: ReconnectPolicy) -> Self {
+        let cap_ms = u64::try_from(policy.cap.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let initial_ms = u64::try_from(policy.initial.as_millis())
+            .unwrap_or(u64::MAX)
+            .min(cap_ms)
+            .max(1);
+        Self {
+            initial_ms,
+            next_ms: initial_ms,
+            multiplier: u64::from(policy.multiplier.max(1)),
+            cap_ms,
+        }
+    }
+
+    /// The unjittered wait after this loss; the next loss waits longer.
+    fn wait_ms(&mut self) -> u64 {
+        let wait = self.next_ms;
+        self.next_ms = self
+            .next_ms
+            .saturating_mul(self.multiplier)
+            .min(self.cap_ms);
+        wait
+    }
+
+    /// A successful connect restarts the cadence at `initial`.
+    fn reset(&mut self) {
+        self.next_ms = self.initial_ms;
+    }
+}
+
 fn jittered(base_ms: u64) -> Duration {
     let mut extra = [0_u8; 8];
     getrandom::fill(&mut extra).unwrap_or_default();
     let jitter = u64::from_be_bytes(extra) % (base_ms / 2 + 1);
-    Duration::from_millis(base_ms + jitter)
+    // The CLI accepts the full positive u64 range, so the addition must not
+    // overflow: base and jitter are added as Durations, which can always hold
+    // their sum (two u64 millisecond counts stay far below Duration::MAX).
+    Duration::from_millis(base_ms) + Duration::from_millis(jitter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Backoff, MAX_SCHEDULABLE_WAIT, ReconnectPolicy, WaitOutcome, jittered, paced_wait,
+    };
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    /// The loop must select exactly `initial`, then `initial * multiplier^k`
+    /// clamped at `cap` — never beyond it. A cadence that let the cap slip
+    /// (e.g. one that settled at 2×cap) would select different delays here
+    /// even where coarse socket-gap windows could not tell it apart.
+    #[test]
+    fn the_progression_reaches_the_cap_and_holds_it() {
+        let mut backoff = Backoff::new(ReconnectPolicy {
+            initial: Duration::from_millis(100),
+            multiplier: 4,
+            cap: Duration::from_millis(200),
+        });
+        let waits = (0..6).map(|_| backoff.wait_ms()).collect::<Vec<_>>();
+        assert_eq!(waits, [100, 200, 200, 200, 200, 200]);
+    }
+
+    /// A successful connect restarts the cadence at `initial`, not at the
+    /// grown value the losses had reached.
+    #[test]
+    fn a_successful_connect_resets_the_progression() {
+        let mut backoff = Backoff::new(ReconnectPolicy {
+            initial: Duration::from_millis(40),
+            multiplier: 4,
+            cap: Duration::from_millis(500),
+        });
+        assert_eq!(backoff.wait_ms(), 40);
+        assert_eq!(backoff.wait_ms(), 160);
+        assert_eq!(backoff.wait_ms(), 500);
+        backoff.reset();
+        assert_eq!(backoff.wait_ms(), 40);
+        assert_eq!(backoff.wait_ms(), 160);
+    }
+
+    /// Jitter can only stretch the selected wait by up to +50 %.
+    #[test]
+    fn jitter_stays_within_half_the_base() {
+        for _ in 0..256 {
+            let wait = jittered(200);
+            assert!(wait >= Duration::from_millis(200));
+            assert!(wait <= Duration::from_millis(300));
+        }
+    }
+
+    /// The CLI accepts the full positive u64 millisecond range. At the
+    /// accepted upper bound the jittered wait is still selected correctly:
+    /// it stays in `[base, base + base/2]` and never panics or wraps short.
+    #[test]
+    fn jitter_at_the_largest_accepted_base_never_overflows() {
+        let base = Duration::from_millis(u64::MAX);
+        for _ in 0..64 {
+            let wait = jittered(u64::MAX);
+            assert!(wait >= base);
+            assert!(wait <= base + Duration::from_millis(u64::MAX / 2));
+        }
+    }
+
+    /// A wait inside any platform timer's range still elapses on its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_schedulable_wait_elapses() {
+        let (_sender, mut stop) = watch::channel(false);
+        let wait =
+            tokio::spawn(async move { paced_wait(Duration::from_millis(50), &mut stop).await });
+        tokio::time::advance(Duration::from_millis(60)).await;
+        assert_eq!(
+            wait.await.expect("the wait task completes"),
+            WaitOutcome::Waited
+        );
+    }
+
+    /// The largest wait the accepted range can select is past every platform
+    /// timer's `Instant` range — where a single `sleep` would be silently
+    /// shortened to a nearer deadline. Chunked scheduling proves the whole
+    /// wait is held: several full chunks leave it pending, and `stop` still
+    /// ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_past_the_timers_range_stays_pending_and_stops() {
+        let (sender, mut stop) = watch::channel(false);
+        let wait = Duration::from_millis(u64::MAX) + Duration::from_millis(u64::MAX / 2);
+        let waiter = tokio::spawn(async move { paced_wait(wait, &mut stop).await });
+        tokio::task::yield_now().await;
+
+        for _ in 0..4 {
+            tokio::time::advance(MAX_SCHEDULABLE_WAIT).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "a u64::MAX-scale wait must not be shortened to a nearer deadline"
+        );
+
+        sender.send(true).expect("the stop channel is open");
+        assert_eq!(
+            waiter.await.expect("the wait task completes"),
+            WaitOutcome::Stopped
+        );
+    }
+
+    /// A `false` stop update is not a stop request: the timer keeps
+    /// running, and a real stop during the same wait still ends it. A wait
+    /// that ended on the `false` edge would skip the backoff entirely.
+    #[tokio::test(start_paused = true)]
+    async fn a_false_stop_update_leaves_the_wait_running() {
+        let (sender, mut stop) = watch::channel(false);
+        let waiter =
+            tokio::spawn(async move { paced_wait(Duration::from_millis(50), &mut stop).await });
+        tokio::task::yield_now().await;
+
+        sender.send(false).expect("the stop channel is open");
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a false update must not end the wait early"
+        );
+
+        sender.send(true).expect("the stop channel is open");
+        assert_eq!(
+            waiter.await.expect("the wait task completes"),
+            WaitOutcome::Stopped,
+            "a real stop after the false edge still ends the wait"
+        );
+    }
+
+    /// After a `false` update the timer still expires on its own — the
+    /// wait ends when the clock says it elapsed, not when the channel
+    /// twitched.
+    #[tokio::test(start_paused = true)]
+    async fn the_timer_still_expires_after_a_false_update() {
+        let (sender, mut stop) = watch::channel(false);
+        let waiter =
+            tokio::spawn(async move { paced_wait(Duration::from_millis(50), &mut stop).await });
+        tokio::task::yield_now().await;
+
+        sender.send(false).expect("the stop channel is open");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        assert_eq!(
+            waiter.await.expect("the wait task completes"),
+            WaitOutcome::Waited
+        );
+    }
+
+    /// Dropping the last sender closes the channel. The connected receive
+    /// loop's `stop.changed()` branch ends the loop on that same event, so
+    /// the wait ends the same way — as a stop — instead of falling through
+    /// to a `false` read that would skip every retry delay.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_stop_channel_ends_the_wait_as_stopped() {
+        let (sender, mut stop) = watch::channel(false);
+        let waiter =
+            tokio::spawn(async move { paced_wait(Duration::from_secs(3_600), &mut stop).await });
+        tokio::task::yield_now().await;
+        drop(sender);
+        assert_eq!(
+            waiter.await.expect("the wait task completes"),
+            WaitOutcome::Stopped
+        );
+    }
+
+    /// The wait is measured on the monotonic clock, not counted in chunks:
+    /// a task suspended while the clock advances past several chunks finds
+    /// nothing left to sleep when it resumes. Chunk arithmetic alone would
+    /// have it sleep the unslept remainder anyway.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_advance_spanning_chunks_ends_the_wait() {
+        let (_sender, mut stop) = watch::channel(false);
+        // 36 hours: two schedulable chunks, the second partial.
+        let wait = MAX_SCHEDULABLE_WAIT + MAX_SCHEDULABLE_WAIT / 2;
+        let waiter = tokio::spawn(async move { paced_wait(wait, &mut stop).await });
+        tokio::task::yield_now().await;
+
+        // The task sleeps the first chunk; the clock advances 48 hours
+        // before it resumes — past the whole wait.
+        tokio::time::advance(MAX_SCHEDULABLE_WAIT * 2).await;
+        assert_eq!(
+            waiter.await.expect("the wait task completes"),
+            WaitOutcome::Waited,
+            "elapsed monotonic time, not scheduled chunks, decides what remains"
+        );
+    }
 }

@@ -722,6 +722,86 @@ async fn stop_observed_while_connected_and_idle() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_false_stop_update_keeps_the_connected_receiver() {
+    let (station, dir) = start_station(Behaviour::Normal, true).await;
+    let credentials = mint_credentials(&station, &dir);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    struct Never;
+    impl PacketSink for Never {
+        fn accept(&mut self, _sequence: u64, _handle: HandleToken, _packet: &[u8]) -> Verdict {
+            Verdict::Done
+        }
+    }
+    let mut never = Never;
+    let roots = roots(&station);
+    let task = tokio::spawn(async move {
+        receive_loop(
+            &credentials,
+            &roots,
+            &mut never,
+            rx,
+            ReconnectPolicy::default(),
+        )
+        .await
+    });
+    // Let the connection establish, then publish `false`: a library caller
+    // toggling the flag off is not a stop request, and the connected
+    // receiver must survive it — the same rule the backoff wait applies.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tx.send(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !task.is_finished(),
+        "a false update must not end the connected receiver"
+    );
+    tx.send(true).unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+    {
+        Ok(LoopExit::Stopped) => {}
+        other => panic!("expected prompt Stopped after the real stop, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_stop_channel_ends_the_connected_receiver() {
+    let (station, dir) = start_station(Behaviour::Normal, true).await;
+    let credentials = mint_credentials(&station, &dir);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    struct Never;
+    impl PacketSink for Never {
+        fn accept(&mut self, _sequence: u64, _handle: HandleToken, _packet: &[u8]) -> Verdict {
+            Verdict::Done
+        }
+    }
+    let mut never = Never;
+    let roots = roots(&station);
+    let task = tokio::spawn(async move {
+        receive_loop(
+            &credentials,
+            &roots,
+            &mut never,
+            rx,
+            ReconnectPolicy::default(),
+        )
+        .await
+    });
+    // Let the connection establish, then drop the sender: the connected
+    // loop ends as Stopped, the same verdict `paced_wait` reports during
+    // backoff.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(tx);
+    match tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+    {
+        Ok(LoopExit::Stopped) => {}
+        other => panic!("expected Stopped on channel closure, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn submit_carrier_refuses_a_current_thread_runtime() {
     let (station, dir) = start_station(Behaviour::Normal, true).await;

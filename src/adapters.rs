@@ -49,7 +49,11 @@ use crate::{AuthorityInput, VerifiedProtocolLine};
 
 mod replacement;
 
-pub use replacement::{ReplacementRequest, admit_replacement, admit_replacement_with_authority};
+pub use replacement::{
+    ColdReplacementRequest, ReplacementRequest, admit_replacement, admit_replacement_catch_up,
+    admit_replacement_catch_up_with_authority, admit_replacement_cold,
+    admit_replacement_cold_with_authority, admit_replacement_with_authority,
+};
 
 /// Resolves a non-secret custody token to the caller's own custody handle.
 ///

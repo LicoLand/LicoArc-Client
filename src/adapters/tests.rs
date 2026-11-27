@@ -798,4 +798,118 @@ mod replacement_composition {
             Some(ReplacementAuthorityRefusal::UnreadableAuthority)
         );
     }
+
+    /// The sessionless requests apply the same credential and replay rules.
+    ///
+    /// The artifact-accepting branches are the `#[ignore]`d cases in
+    /// `crate::replacement_admission`; what is proved here is that a cold
+    /// request is refused in the same terms and order as the session one.
+    #[test]
+    fn a_cold_request_keeps_the_credential_and_replay_rules() {
+        use crate::{
+            ColdAdmission, ColdReplacementRequest, ReplacementPredecessor,
+            admit_replacement_catch_up, admit_replacement_cold,
+        };
+
+        fn cold_request(source: AuthoritySource) -> ColdReplacementRequest {
+            ColdReplacementRequest::new(
+                source,
+                binding(),
+                ColdAdmission {
+                    predecessor: None,
+                    endpoints: Vec::new(),
+                },
+            )
+        }
+
+        // Ordinary input is refused before the absent line is reached, exactly
+        // like the session path.
+        for admit in [
+            |request: &ColdReplacementRequest| {
+                admit_replacement_cold(&refusing_adapter(), &json!({}), request)
+            },
+            |request: &ColdReplacementRequest| {
+                admit_replacement_catch_up(&refusing_adapter(), &[json!({})], request)
+            },
+        ] {
+            let refusal = admit(&cold_request(AuthoritySource::None));
+            assert_eq!(
+                refusal.refusal(),
+                Some(ReplacementAuthorityRefusal::NoTrustedAuthority),
+                "a cold request with no credential is unauthorized, not unverified"
+            );
+        }
+
+        // A real source reaches the boundary, which reports the absent line.
+        let refusal = admit_replacement_cold(
+            &refusing_adapter(),
+            &json!({}),
+            &cold_request(AuthoritySource::SavedRecoveryCredential),
+        );
+        assert_eq!(
+            refusal.refusal(),
+            Some(ReplacementAuthorityRefusal::NoTrustedAuthority)
+        );
+
+        // The replay guard still fires before the SDK: a tip at the accepted
+        // epoch is refused from the caller's own epoch.
+        let replayed = ColdReplacementRequest::new(
+            AuthoritySource::SavedRecoveryCredential,
+            binding(),
+            ColdAdmission {
+                predecessor: Some(ReplacementPredecessor::new(
+                    licoarc::identity::AcceptedUserAuthority {
+                        state: json!({}),
+                        user_identity_ref: [0; 32],
+                        authority_epoch: 4,
+                        state_digest: [0; 32],
+                    },
+                )),
+                endpoints: Vec::new(),
+            },
+        );
+        let refusal = admit_replacement_cold(
+            &refusing_adapter(),
+            &json!({"authorityEpoch": 4}),
+            &replayed,
+        );
+        assert_eq!(
+            refusal.refusal(),
+            Some(ReplacementAuthorityRefusal::ReplayedAuthority {
+                accepted_epoch: 4,
+                presented_epoch: 4,
+            })
+        );
+        let refusal = admit_replacement_catch_up(
+            &refusing_adapter(),
+            &[json!({"authorityEpoch": 2}), json!({"authorityEpoch": 3})],
+            &replayed,
+        );
+        assert_eq!(
+            refusal.refusal(),
+            Some(ReplacementAuthorityRefusal::ReplayedAuthority {
+                accepted_epoch: 4,
+                presented_epoch: 3,
+            }),
+            "the chain's tip is the epoch the replay guard compares"
+        );
+
+        // An empty chain has no tip to read: unreadable with an accepted
+        // epoch, SDK-refused without one.
+        let refusal = admit_replacement_catch_up(&refusing_adapter(), &[], &replayed);
+        assert_eq!(
+            refusal.refusal(),
+            Some(ReplacementAuthorityRefusal::UnreadableAuthority)
+        );
+        let refusal = admit_replacement_catch_up(
+            &refusing_adapter(),
+            &[],
+            &cold_request(AuthoritySource::SavedRecoveryCredential),
+        );
+        assert_eq!(
+            refusal.refusal(),
+            Some(ReplacementAuthorityRefusal::NoTrustedAuthority),
+            "the refusing boundary reports the absent line on an empty chain"
+        );
+    }
 }

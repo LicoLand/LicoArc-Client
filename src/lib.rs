@@ -40,9 +40,11 @@ pub mod session;
 pub mod version;
 
 pub use adapters::{
-    AdmittedProtocolWork, AtomicStateAdapter, ClockAdapter, CustodyHandles, KeyCustodyAdapter,
-    PacketCarrierAdapter, ProtocolAdmissionRefusal, ProtocolPorts, ProtocolWorkSetup,
-    ReplacementRequest, admit_replacement, admit_replacement_with_authority,
+    AdmittedProtocolWork, AtomicStateAdapter, ClockAdapter, ColdReplacementRequest, CustodyHandles,
+    KeyCustodyAdapter, PacketCarrierAdapter, ProtocolAdmissionRefusal, ProtocolPorts,
+    ProtocolWorkSetup, ReplacementRequest, admit_replacement, admit_replacement_catch_up,
+    admit_replacement_catch_up_with_authority, admit_replacement_cold,
+    admit_replacement_cold_with_authority, admit_replacement_with_authority,
 };
 pub use admission::{AUTHORIZATION_REQUIRED, AdmissionRefusal, AuthorityInput};
 pub use authority::{
@@ -75,7 +77,7 @@ pub use replacement::{
     ReplacementBinding, ReplacementCredentials, ReplacementOperation, ReplacementPossession,
 };
 pub use replacement_admission::{
-    ReplacementAdmission, ReplacementAdmissionRefusal, ReplacementEndpointKeys,
+    ColdAdmission, ReplacementAdmission, ReplacementAdmissionRefusal, ReplacementEndpointKeys,
     ReplacementPredecessor, ReplacementSession, SdkReplacementAuthority,
     VerifiedReplacementAuthority,
 };
